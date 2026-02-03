@@ -19,7 +19,7 @@
 # the License.
 # =============================================================================
 
-cmake_minimum_required(VERSION 3.24.0 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.22.0 FATAL_ERROR)
 
 set(FAISS_LANGUAGES CXX)
 
@@ -113,6 +113,7 @@ if(FAISS_ENABLE_EXTRAS)
   add_subdirectory(demos)
   add_subdirectory(benchs)
   add_subdirectory(tutorial/cpp)
+  add_subdirectory(experiments)
 endif()
 
 # CTest must be included in the top level to enable `make test` target.
