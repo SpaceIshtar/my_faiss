@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -110,6 +111,60 @@ float compute_recall_at_k(
 }
 
 /*****************************************************
+ * Result storage
+ *****************************************************/
+
+struct BenchmarkResult {
+    size_t ef;
+    double qps;
+    float recall;
+    double latency_ms;
+};
+
+void create_directory(const std::string& path) {
+    std::string cmd = "mkdir -p " + path;
+    system(cmd.c_str());
+}
+
+// Extract dataset name from path (e.g., "/data/local/embedding_dataset/sift1M" -> "sift1M")
+std::string get_dataset_name(const std::string& path) {
+    size_t pos = path.rfind('/');
+    if (pos != std::string::npos && pos + 1 < path.size()) {
+        return path.substr(pos + 1);
+    }
+    return path;
+}
+
+// Extract M and efConstruction from index path (e.g., "hnsw_M32_ef200.faissindex")
+std::pair<int, int> parse_index_params(const std::string& index_path) {
+    int M = 32, efC = 200;  // defaults
+
+    // Find "M" followed by digits
+    size_t m_pos = index_path.find("_M");
+    if (m_pos != std::string::npos) {
+        m_pos += 2;  // skip "_M"
+        size_t end = m_pos;
+        while (end < index_path.size() && std::isdigit(index_path[end])) end++;
+        if (end > m_pos) {
+            M = std::stoi(index_path.substr(m_pos, end - m_pos));
+        }
+    }
+
+    // Find "ef" followed by digits
+    size_t ef_pos = index_path.find("_ef");
+    if (ef_pos != std::string::npos) {
+        ef_pos += 3;  // skip "_ef"
+        size_t end = ef_pos;
+        while (end < index_path.size() && std::isdigit(index_path[end])) end++;
+        if (end > ef_pos) {
+            efC = std::stoi(index_path.substr(ef_pos, end - ef_pos));
+        }
+    }
+
+    return {M, efC};
+}
+
+/*****************************************************
  * Main
  *****************************************************/
 
@@ -160,9 +215,14 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "HNSW load time: " << timer.elapsed_ms() << " ms" << std::endl;
 
+    // Parse HNSW parameters from index path
+    auto [hnsw_M, hnsw_efC] = parse_index_params(index_path);
+    std::string dataset_name = get_dataset_name(data_path);
+
     // Search parameters
     const size_t k = 10;
     std::vector<size_t> ef_values = {10, 20, 30, 40, 50, 75, 100, 150, 200};
+    std::vector<BenchmarkResult> results;
 
     // ==========================================
     // Benchmark: Standard HNSW (exact distances)
@@ -196,10 +256,39 @@ int main(int argc, char* argv[]) {
         double latency = search_time / nq;
         float recall = compute_recall_at_k(nq, k, result_ids.data(), gt, k_gt);
 
+        results.push_back({ef, qps, recall, latency});
+
         std::cout << std::setw(8) << ef
                   << std::setw(15) << std::fixed << std::setprecision(0) << qps
                   << std::setw(15) << std::setprecision(4) << recall
                   << std::setw(15) << std::setprecision(3) << latency << std::endl;
+    }
+
+    // Save results to file
+    std::string result_dir = "experiments/hnsw/results/" + dataset_name + "/standard";
+    create_directory(result_dir);
+    std::string result_file = result_dir + "/M" + std::to_string(hnsw_M) +
+        "_efc" + std::to_string(hnsw_efC) + ".txt";
+
+    std::ofstream ofs(result_file);
+    if (ofs.is_open()) {
+        ofs << "# Standard HNSW Benchmark (Exact Distances)\n"
+            << "# Dataset: " << dataset_name << "\n"
+            << "# HNSW M: " << hnsw_M << ", efConstruction: " << hnsw_efC << "\n"
+            << "# k: " << k << "\n\n"
+            << std::setw(8) << "ef"
+            << std::setw(15) << "QPS"
+            << std::setw(15) << "Recall"
+            << std::setw(15) << "Latency(ms)" << "\n";
+
+        for (const auto& r : results) {
+            ofs << std::setw(8) << r.ef
+                << std::setw(15) << std::fixed << std::setprecision(0) << r.qps
+                << std::setw(15) << std::setprecision(4) << r.recall
+                << std::setw(15) << std::setprecision(3) << r.latency_ms << "\n";
+        }
+        ofs.close();
+        std::cout << "\nResults saved to: " << result_file << std::endl;
     }
 
     std::cout << "\nTotal time: " << std::fixed << std::setprecision(1)

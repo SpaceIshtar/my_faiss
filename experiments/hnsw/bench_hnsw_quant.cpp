@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -45,11 +46,15 @@
 #include <faiss/impl/HNSW.h>
 #include <faiss/impl/ResultHandler.h>
 
+#include "include/aq_wrapper.h"
 #include "include/bench_config.h"
 #include "include/bench_utils.h"
+#include "include/opq_wrapper.h"
 #include "include/pq_wrapper.h"
 #include "include/quant_wrapper.h"
+#include "include/rabitq_wrapper.h"
 #include "include/sq_wrapper.h"
+#include "include/vaq_wrapper.h"
 
 using namespace hnsw_bench;
 
@@ -57,7 +62,7 @@ using namespace hnsw_bench;
  * HNSW search with quantization + rerank
  *****************************************************/
 
-void hnsw_search_with_rerank(
+QueryStats hnsw_search_with_rerank(
         const faiss::IndexHNSW* hnsw_index,
         faiss::DistanceComputer* quant_dc,
         faiss::DistanceComputer* exact_dc,
@@ -74,13 +79,13 @@ void hnsw_search_with_rerank(
     exact_dc->set_query(query);
 
     // Prepare heap for ef candidates
-    using C = faiss::CMax<float, faiss::idx_t>;
+    using RH = faiss::HeapBlockResultHandler<faiss::HNSW::C>;
     std::vector<float> ef_distances(ef, std::numeric_limits<float>::max());
     std::vector<faiss::idx_t> ef_labels(ef, -1);
 
     // Create result handler
-    faiss::HeapBlockResultHandler<C, false> bres(1, ef_distances.data(), ef_labels.data(), ef);
-    typename faiss::HeapBlockResultHandler<C, false>::SingleResultHandler res(bres);
+    RH bres(1, ef_distances.data(), ef_labels.data(), ef);
+    RH::SingleResultHandler res(bres);
 
     // VisitedTable for search
     faiss::VisitedTable vt(hnsw_index->ntotal);
@@ -89,9 +94,9 @@ void hnsw_search_with_rerank(
     faiss::SearchParametersHNSW params;
     params.efSearch = ef;
 
-    // HNSW search using quantized distances
+    // HNSW search using quantized distances (returns HNSWStats)
     res.begin(0);
-    hnsw.search(*quant_dc, hnsw_index, res, vt, &params);
+    faiss::HNSWStats stats = hnsw.search(*quant_dc, hnsw_index, res, vt, &params);
     res.end();
 
     // Rerank using exact distances
@@ -117,6 +122,12 @@ void hnsw_search_with_rerank(
             labels[i] = -1;
         }
     }
+
+    // Return query stats
+    QueryStats qs;
+    qs.ndis = stats.ndis;
+    qs.nhops = stats.nhops;
+    return qs;
 }
 
 /*****************************************************
@@ -128,6 +139,8 @@ struct BenchmarkResult {
     double qps;
     float recall;
     double latency_ms;
+    double total_time_ms;
+    SearchStats stats;
 };
 
 std::vector<BenchmarkResult> run_benchmark(
@@ -150,6 +163,7 @@ std::vector<BenchmarkResult> run_benchmark(
     for (size_t ef : ef_values) {
         std::vector<faiss::idx_t> result_ids(nq * k, -1);
         std::vector<float> result_dists(nq * k, std::numeric_limits<float>::max());
+        std::vector<QueryStats> query_stats(nq);
 
         // Warmup
         size_t warmup_n = std::min((size_t)10, nq);
@@ -164,7 +178,7 @@ std::vector<BenchmarkResult> run_benchmark(
                 result_ids.data() + i * k);
         }
 
-        // Timed search
+        // Timed search with stats collection
         timer.reset();
 
         #pragma omp parallel num_threads(num_threads)
@@ -175,7 +189,7 @@ std::vector<BenchmarkResult> run_benchmark(
 
             #pragma omp for schedule(dynamic, 1)
             for (int64_t i = 0; i < (int64_t)nq; i++) {
-                hnsw_search_with_rerank(
+                query_stats[i] = hnsw_search_with_rerank(
                     hnsw_index, quant_dc.get(), exact_dc.get(),
                     xq + i * d, k, ef,
                     result_dists.data() + i * k,
@@ -187,18 +201,133 @@ std::vector<BenchmarkResult> run_benchmark(
         double qps = nq * 1000.0 / search_time;
         double latency = search_time / nq;
         float recall = compute_recall_at_k(nq, k, result_ids.data(), gt, gt_k);
+        SearchStats stats = SearchStats::compute(query_stats);
 
-        results.push_back({ef, qps, recall, latency});
+        results.push_back({ef, qps, recall, latency, search_time, stats});
 
         if (verbose) {
             std::cout << std::setw(8) << ef
-                      << std::setw(15) << std::fixed << std::setprecision(0) << qps
-                      << std::setw(15) << std::setprecision(4) << recall
-                      << std::setw(15) << std::setprecision(3) << latency << std::endl;
+                      << std::setw(12) << std::fixed << std::setprecision(0) << qps
+                      << std::setw(12) << std::setprecision(4) << recall
+                      << std::setw(12) << std::setprecision(3) << latency
+                      << std::setw(12) << std::setprecision(1) << stats.ndis_stats.mean
+                      << std::setw(12) << std::setprecision(1) << stats.nhops_stats.mean
+                      << std::endl;
         }
     }
 
     return results;
+}
+
+/*****************************************************
+ * Result file output
+ *****************************************************/
+
+void print_percentile_stats(std::ostream& os, const std::string& name, const PercentileStats& stats) {
+    os << "  " << name << ":\n"
+       << "    min:      " << std::fixed << std::setprecision(2) << stats.min << "\n"
+       << "    p10:      " << stats.p10 << "\n"
+       << "    p25:      " << stats.p25 << "\n"
+       << "    p50:      " << stats.p50 << "\n"
+       << "    p75:      " << stats.p75 << "\n"
+       << "    p90:      " << stats.p90 << "\n"
+       << "    max:      " << stats.max << "\n"
+       << "    mean:     " << stats.mean << "\n"
+       << "    variance: " << stats.variance << "\n"
+       << "    stddev:   " << stats.stddev << "\n";
+}
+
+void save_results_to_file(
+        const std::string& filepath,
+        const std::string& dataset_name,
+        const std::string& algorithm_name,
+        const std::string& quant_params,
+        int hnsw_M,
+        int hnsw_efConstruction,
+        size_t nq,
+        size_t k,
+        const std::vector<BenchmarkResult>& results) {
+
+    // Create directory if needed
+    size_t last_slash = filepath.rfind('/');
+    if (last_slash != std::string::npos) {
+        create_directory(filepath.substr(0, last_slash));
+    }
+
+    std::ofstream ofs(filepath);
+    if (!ofs.is_open()) {
+        std::cerr << "Error: Could not open file for writing: " << filepath << std::endl;
+        return;
+    }
+
+    // Header
+    ofs << "========================================\n"
+        << "HNSW + Quantization Benchmark Results\n"
+        << "========================================\n\n";
+
+    // Configuration
+    ofs << "[Configuration]\n"
+        << "  Dataset:           " << dataset_name << "\n"
+        << "  Algorithm:         " << algorithm_name << "\n"
+        << "  Quant Params:      " << quant_params << "\n"
+        << "  HNSW M:            " << hnsw_M << "\n"
+        << "  HNSW efConstruct:  " << hnsw_efConstruction << "\n"
+        << "  Num Queries:       " << nq << "\n"
+        << "  Recall@k:          " << k << "\n\n";
+
+    // Summary table
+    ofs << "[Summary]\n"
+        << std::setw(8) << "ef"
+        << std::setw(12) << "QPS"
+        << std::setw(12) << "Recall"
+        << std::setw(12) << "Latency(ms)"
+        << std::setw(12) << "ndis_mean"
+        << std::setw(12) << "nhops_mean"
+        << "\n"
+        << std::string(68, '-') << "\n";
+
+    for (const auto& r : results) {
+        ofs << std::setw(8) << r.ef
+            << std::setw(12) << std::fixed << std::setprecision(0) << r.qps
+            << std::setw(12) << std::setprecision(4) << r.recall
+            << std::setw(12) << std::setprecision(3) << r.latency_ms
+            << std::setw(12) << std::setprecision(1) << r.stats.ndis_stats.mean
+            << std::setw(12) << std::setprecision(1) << r.stats.nhops_stats.mean
+            << "\n";
+    }
+    ofs << "\n";
+
+    // Detailed statistics for each ef value
+    ofs << "[Detailed Statistics]\n";
+    for (const auto& r : results) {
+        ofs << "\n--- ef = " << r.ef << " ---\n"
+            << "  QPS:          " << std::fixed << std::setprecision(2) << r.qps << "\n"
+            << "  Recall@" << k << ":    " << std::setprecision(4) << r.recall << "\n"
+            << "  Total Time:   " << std::setprecision(2) << r.total_time_ms << " ms\n"
+            << "  Avg Latency:  " << std::setprecision(4) << r.latency_ms << " ms\n\n";
+
+        print_percentile_stats(ofs, "ndis (distance computations)", r.stats.ndis_stats);
+        ofs << "\n";
+        print_percentile_stats(ofs, "nhops (graph edges traversed)", r.stats.nhops_stats);
+    }
+
+    ofs << "\n========================================\n"
+        << "End of Results\n"
+        << "========================================\n";
+
+    ofs.close();
+    std::cout << "Results saved to: " << filepath << std::endl;
+}
+
+std::string generate_result_filename(
+        const std::string& algorithm,
+        const std::string& quant_params,
+        int hnsw_M,
+        int hnsw_efConstruction) {
+    std::ostringstream oss;
+    oss << algorithm << "_" << quant_params
+        << "_M" << hnsw_M << "_efc" << hnsw_efConstruction << ".txt";
+    return oss.str();
 }
 
 /*****************************************************
@@ -213,8 +342,22 @@ std::unique_ptr<QuantWrapper> create_wrapper(
 
     if (algorithm == "pq") {
         return create_pq_wrapper(d, metric, params);
+    } else if (algorithm == "opq") {
+        return create_opq_wrapper(d, metric, params);
     } else if (algorithm == "sq") {
         return create_sq_wrapper(d, metric, params);
+    } else if (algorithm == "rq") {
+        return create_rq_wrapper(d, metric, params);
+    } else if (algorithm == "lsq") {
+        return create_lsq_wrapper(d, metric, params);
+    } else if (algorithm == "prq") {
+        return create_prq_wrapper(d, metric, params);
+    } else if (algorithm == "plsq") {
+        return create_plsq_wrapper(d, metric, params);
+    } else if (algorithm == "vaq") {
+        return create_vaq_wrapper(d, metric, params);
+    } else if (algorithm == "rabitq") {
+        return create_rabitq_wrapper(d, metric, params);
     } else {
         throw std::runtime_error("Unknown algorithm: " + algorithm);
     }
@@ -348,9 +491,32 @@ int main(int argc, char** argv) {
             param_sets.push_back({.params = {{"M", "8"}, {"nbits", "8"}}});
             param_sets.push_back({.params = {{"M", "16"}, {"nbits", "8"}}});
             param_sets.push_back({.params = {{"M", "32"}, {"nbits", "8"}}});
+        } else if (opts.algorithm == "opq") {
+            param_sets.push_back({.params = {{"M", "8"}, {"nbits", "8"}}});
+            param_sets.push_back({.params = {{"M", "16"}, {"nbits", "8"}}});
+            param_sets.push_back({.params = {{"M", "32"}, {"nbits", "8"}}});
         } else if (opts.algorithm == "sq") {
             param_sets.push_back({.params = {{"qtype", "QT_8bit"}}});
             param_sets.push_back({.params = {{"qtype", "QT_4bit"}}});
+        } else if (opts.algorithm == "rq") {
+            param_sets.push_back({.params = {{"M", "8"}, {"nbits", "8"}}});
+            param_sets.push_back({.params = {{"M", "16"}, {"nbits", "8"}}});
+        } else if (opts.algorithm == "lsq") {
+            param_sets.push_back({.params = {{"M", "8"}, {"nbits", "8"}}});
+            param_sets.push_back({.params = {{"M", "16"}, {"nbits", "8"}}});
+        } else if (opts.algorithm == "prq") {
+            param_sets.push_back({.params = {{"nsplits", "2"}, {"Msub", "4"}, {"nbits", "8"}}});
+            param_sets.push_back({.params = {{"nsplits", "4"}, {"Msub", "4"}, {"nbits", "8"}}});
+        } else if (opts.algorithm == "plsq") {
+            param_sets.push_back({.params = {{"nsplits", "2"}, {"Msub", "4"}, {"nbits", "8"}}});
+            param_sets.push_back({.params = {{"nsplits", "4"}, {"Msub", "4"}, {"nbits", "8"}}});
+        } else if (opts.algorithm == "vaq") {
+            param_sets.push_back({.params = {{"bits", "128"}, {"nsub", "16"}, {"minbps", "7"}, {"maxbps", "9"}}});
+            param_sets.push_back({.params = {{"bits", "256"}, {"nsub", "32"}, {"minbps", "7"}, {"maxbps", "9"}}});
+        } else if (opts.algorithm == "rabitq") {
+            param_sets.push_back({.params = {{"bits", "1"}}});
+            param_sets.push_back({.params = {{"bits", "2"}}});
+            param_sets.push_back({.params = {{"bits", "4"}}});
         }
     }
 
@@ -404,16 +570,30 @@ int main(int argc, char** argv) {
 
         // Print results header
         std::cout << "\n" << std::setw(8) << "ef"
-                  << std::setw(15) << "QPS"
-                  << std::setw(15) << "Recall@" << ds_cfg.k
-                  << std::setw(15) << "Latency(ms)" << std::endl;
-        std::cout << std::string(53, '-') << std::endl;
+                  << std::setw(12) << "QPS"
+                  << std::setw(12) << "Recall@" << ds_cfg.k
+                  << std::setw(12) << "Latency(ms)"
+                  << std::setw(12) << "ndis_mean"
+                  << std::setw(12) << "nhops_mean" << std::endl;
+        std::cout << std::string(68, '-') << std::endl;
 
         // Run benchmark
-        run_benchmark(
+        auto results = run_benchmark(
             hnsw_index, flat_index, quant.get(),
             xq, nq, d, gt, gt_k, ds_cfg.k,
             ds_cfg.ef_search_values, ds_cfg.threads);
+
+        // Save results to file
+        std::string quant_params = quant->get_params_string();
+        std::string result_filename = generate_result_filename(
+            opts.algorithm, quant_params, ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction);
+        std::string result_dir = "experiments/hnsw/results/" + opts.dataset + "/" + opts.algorithm;
+        std::string result_path = result_dir + "/" + result_filename;
+
+        save_results_to_file(
+            result_path, opts.dataset, opts.algorithm, quant_params,
+            ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction,
+            nq, ds_cfg.k, results);
     }
 
     std::cout << "\nTotal time: " << std::fixed << std::setprecision(1)

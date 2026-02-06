@@ -213,4 +213,132 @@ inline bool file_exists(const std::string& path) {
     return false;
 }
 
+/*****************************************************
+ * Statistics utilities
+ *****************************************************/
+
+/**
+ * Percentile statistics for a distribution.
+ */
+struct PercentileStats {
+    double min = 0;
+    double p5 = 0;    // 5th percentile
+    double p10 = 0;   // 10th percentile
+    double p25 = 0;   // 25th percentile (Q1)
+    double p50 = 0;   // 50th percentile (median)
+    double p75 = 0;   // 75th percentile (Q3)
+    double p90 = 0;   // 90th percentile
+    double p95 = 0;   // 95th percentile
+    double max = 0;
+    double mean = 0;
+    double variance = 0;
+    double stddev = 0;
+};
+
+/**
+ * Compute percentile from sorted data.
+ */
+inline double percentile(const std::vector<double>& sorted_data, double p) {
+    if (sorted_data.empty()) return 0;
+    if (p <= 0) return sorted_data.front();
+    if (p >= 100) return sorted_data.back();
+
+    double index = (p / 100.0) * (sorted_data.size() - 1);
+    size_t lower = static_cast<size_t>(index);
+    size_t upper = lower + 1;
+    double weight = index - lower;
+
+    if (upper >= sorted_data.size()) {
+        return sorted_data.back();
+    }
+    return sorted_data[lower] * (1 - weight) + sorted_data[upper] * weight;
+}
+
+/**
+ * Compute all percentile statistics for a vector of values.
+ */
+template<typename T>
+inline PercentileStats compute_percentile_stats(const std::vector<T>& values) {
+    PercentileStats stats;
+    if (values.empty()) return stats;
+
+    // Copy and sort
+    std::vector<double> sorted(values.begin(), values.end());
+    std::sort(sorted.begin(), sorted.end());
+
+    // Compute percentiles
+    stats.min = sorted.front();
+    stats.max = sorted.back();
+    stats.p5 = percentile(sorted, 5);
+    stats.p10 = percentile(sorted, 10);
+    stats.p25 = percentile(sorted, 25);
+    stats.p50 = percentile(sorted, 50);
+    stats.p75 = percentile(sorted, 75);
+    stats.p90 = percentile(sorted, 90);
+    stats.p95 = percentile(sorted, 95);
+
+    // Compute mean
+    double sum = 0;
+    for (const auto& v : values) {
+        sum += static_cast<double>(v);
+    }
+    stats.mean = sum / values.size();
+
+    // Compute variance
+    double sum_sq = 0;
+    for (const auto& v : values) {
+        double diff = static_cast<double>(v) - stats.mean;
+        sum_sq += diff * diff;
+    }
+    stats.variance = sum_sq / values.size();
+    stats.stddev = std::sqrt(stats.variance);
+
+    return stats;
+}
+
+/**
+ * Per-query search statistics.
+ */
+struct QueryStats {
+    size_t ndis = 0;   // number of distance computations
+    size_t nhops = 0;  // number of hops (edges traversed)
+};
+
+/**
+ * Aggregated search statistics with percentiles.
+ */
+struct SearchStats {
+    PercentileStats ndis_stats;
+    PercentileStats nhops_stats;
+
+    static SearchStats compute(const std::vector<QueryStats>& query_stats) {
+        SearchStats result;
+        if (query_stats.empty()) return result;
+
+        std::vector<size_t> ndis_values, nhops_values;
+        ndis_values.reserve(query_stats.size());
+        nhops_values.reserve(query_stats.size());
+
+        for (const auto& qs : query_stats) {
+            ndis_values.push_back(qs.ndis);
+            nhops_values.push_back(qs.nhops);
+        }
+
+        result.ndis_stats = compute_percentile_stats(ndis_values);
+        result.nhops_stats = compute_percentile_stats(nhops_values);
+
+        return result;
+    }
+};
+
+/*****************************************************
+ * Create directory recursively
+ *****************************************************/
+
+inline void create_directory(const std::string& path) {
+    std::string cmd = "mkdir -p " + path;
+    int ret = system(cmd.c_str());
+    (void)ret;
+}
+
 } // namespace hnsw_bench
