@@ -6,18 +6,24 @@
  */
 
 /**
- * Build DiskANN disk index on SIFT1M dataset.
+ * Build DiskANN disk index, reading parameters from datasets.conf.
  *
  * Usage:
- *   ./build_diskann_index [data_path] [R] [L]
+ *   ./build_diskann_index --dataset <name> [options]
  *
- * Default:
- *   data_path: /data/local/embedding_dataset/sift1M
- *   R (max degree): 64
- *   L (build complexity): 100
+ * Options:
+ *   --dataset <name>         Dataset name (e.g., sift1M, gist1M)
+ *   --config-dir <path>      Config directory (default: ./config)
+ *   --data-path <path>       Override dataset base path
+ *   --R <n>                  Override max degree
+ *   --L <n>                  Override build complexity
+ *   --search-budget <gb>     Override search DRAM budget (GB)
+ *   --build-budget <gb>      Override build DRAM budget (GB)
+ *   --threads <n>            Override number of threads
+ *   --help                   Show this help
  *
  * Output files stored in:
- *   /data/local/embedding_dataset/sift1M/index/diskann_R{R}_L{L}/
+ *   <base_path>/index/diskann_R{R}_L{L}/
  */
 
 #include <cstdio>
@@ -25,65 +31,165 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
-#include <sys/stat.h>
 
 #include "disk_utils.h"
 #include "utils.h"
 
+#include "include/diskann_bench_config.h"
+
+using namespace diskann_bench;
+
+/*****************************************************
+ * Command line parsing
+ *****************************************************/
+
+struct Options {
+    std::string dataset = "sift1M";
+    std::string config_dir = "./config";
+    std::string data_path;         // override
+    int R = -1;                    // -1 = use config
+    int L = -1;
+    float search_budget = -1.0f;   // -1 = use config
+    float build_budget = -1.0f;
+    int threads = -1;
+    bool help = false;
+};
+
+void print_usage(const char* prog) {
+    std::cout << "Usage: " << prog << " --dataset <name> [options]\n\n"
+              << "Options:\n"
+              << "  --dataset <name>         Dataset name (e.g., sift1M, gist1M)\n"
+              << "  --config-dir <path>      Config directory (default: ./config)\n"
+              << "  --data-path <path>       Override dataset base path\n"
+              << "  --R <n>                  Override max degree\n"
+              << "  --L <n>                  Override build complexity\n"
+              << "  --search-budget <gb>     Override search DRAM budget (GB)\n"
+              << "  --build-budget <gb>      Override build DRAM budget (GB)\n"
+              << "  --threads <n>            Override number of threads\n"
+              << "  --help                   Show this help\n\n"
+              << "Example:\n"
+              << "  " << prog << " --dataset sift1M\n"
+              << "  " << prog << " --dataset gist1M --R 64 --L 100 --build-budget 64.0\n";
+}
+
+Options parse_args(int argc, char** argv) {
+    Options opts;
+
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            opts.help = true;
+        } else if (arg == "--dataset" && i + 1 < argc) {
+            opts.dataset = argv[++i];
+        } else if (arg == "--config-dir" && i + 1 < argc) {
+            opts.config_dir = argv[++i];
+        } else if (arg == "--data-path" && i + 1 < argc) {
+            opts.data_path = argv[++i];
+        } else if (arg == "--R" && i + 1 < argc) {
+            opts.R = std::stoi(argv[++i]);
+        } else if (arg == "--L" && i + 1 < argc) {
+            opts.L = std::stoi(argv[++i]);
+        } else if (arg == "--search-budget" && i + 1 < argc) {
+            opts.search_budget = std::stof(argv[++i]);
+        } else if (arg == "--build-budget" && i + 1 < argc) {
+            opts.build_budget = std::stof(argv[++i]);
+        } else if (arg == "--threads" && i + 1 < argc) {
+            opts.threads = std::stoi(argv[++i]);
+        }
+    }
+
+    return opts;
+}
+
+/*****************************************************
+ * Main
+ *****************************************************/
+
 void create_directory(const std::string& path) {
     std::string cmd = "mkdir -p " + path;
     int ret = system(cmd.c_str());
-    (void)ret;  // suppress unused result warning
+    (void)ret;
 }
 
-int main(int argc, char* argv[]) {
-    std::string data_path = "/data/local/embedding_dataset/sift1M";
-    uint32_t R = 64;   // max degree
-    uint32_t L = 100;  // build complexity
+int main(int argc, char** argv) {
+    Options opts = parse_args(argc, argv);
 
-    if (argc > 1) {
-        data_path = argv[1];
+    if (opts.help) {
+        print_usage(argv[0]);
+        return 0;
     }
-    if (argc > 2) {
-        R = std::atoi(argv[2]);
+
+    // Load dataset config
+    std::string datasets_config = opts.config_dir + "/datasets.conf";
+    auto dataset_configs = parse_diskann_datasets(datasets_config);
+
+    DiskANNDatasetConfig ds_cfg;
+    auto it = dataset_configs.find(opts.dataset);
+    if (it != dataset_configs.end()) {
+        ds_cfg = it->second;
+    } else {
+        std::cerr << "Warning: Dataset '" << opts.dataset
+                  << "' not found in " << datasets_config
+                  << ", using defaults" << std::endl;
+        ds_cfg.name = opts.dataset;
+        ds_cfg.base_path = "/data/local/embedding_dataset/" + opts.dataset;
     }
-    if (argc > 3) {
-        L = std::atoi(argv[3]);
+
+    // Apply command line overrides
+    if (!opts.data_path.empty()) {
+        ds_cfg.base_path = opts.data_path;
+    }
+    if (opts.R > 0) {
+        ds_cfg.diskann_R = opts.R;
+    }
+    if (opts.L > 0) {
+        ds_cfg.diskann_L_build = opts.L;
+    }
+    if (opts.search_budget > 0) {
+        ds_cfg.search_dram_budget_gb = opts.search_budget;
+    }
+    if (opts.build_budget > 0) {
+        ds_cfg.build_dram_budget_gb = opts.build_budget;
+    }
+    if (opts.threads > 0) {
+        ds_cfg.threads = opts.threads;
     }
 
     std::cout << "==================================================" << std::endl;
     std::cout << "DiskANN Disk Index Builder" << std::endl;
-    std::cout << "Data path: " << data_path << std::endl;
-    std::cout << "R (max degree): " << R << std::endl;
-    std::cout << "L (build complexity): " << L << std::endl;
+    std::cout << "Dataset: " << opts.dataset << std::endl;
+    std::cout << "Data path: " << ds_cfg.base_path << std::endl;
+    std::cout << "R (max degree): " << ds_cfg.diskann_R << std::endl;
+    std::cout << "L (build complexity): " << ds_cfg.diskann_L_build << std::endl;
+    std::cout << "Search DRAM budget: " << ds_cfg.search_dram_budget_gb << " GB" << std::endl;
+    std::cout << "Build DRAM budget: " << ds_cfg.build_dram_budget_gb << " GB" << std::endl;
+    std::cout << "Threads: " << ds_cfg.threads << std::endl;
     std::cout << "==================================================" << std::endl;
 
     // Paths
-    std::string bin_path = data_path + "/sift_base.bin";
-
-    std::string index_dir = data_path + "/index/diskann_R" + std::to_string(R) + "_L" + std::to_string(L);
-    std::string index_prefix = index_dir + "/diskann_R" + std::to_string(R) + "_L" + std::to_string(L);
+    std::string bin_path = ds_cfg.get_path(ds_cfg.bin_file);
+    std::string index_prefix = ds_cfg.get_diskann_index_prefix();
 
     // Create index directory
-    create_directory(index_dir);
+    size_t last_slash = index_prefix.rfind('/');
+    if (last_slash != std::string::npos) {
+        create_directory(index_prefix.substr(0, last_slash));
+    }
 
     // Build parameters: "R L B M num_threads disk_PQ append_reorder_data build_PQ QD"
-    // B = search DRAM budget (GB)
-    // M = build DRAM budget (GB)
-    float B = 4.0f;   // 4GB search DRAM budget
-    float M = 32.0f;  // 32GB build DRAM budget
-    uint32_t num_threads = 16;
-    uint32_t disk_PQ = 0;           // no disk PQ compression
+    uint32_t disk_PQ = 0;
     uint32_t append_reorder_data = 0;
-    uint32_t build_PQ = 0;          // no build-time PQ
-    uint32_t QD = 0;                // no quantized dimension
+    uint32_t build_PQ = 0;
+    uint32_t QD = 0;
 
-    std::string params = std::to_string(R) + " " + std::to_string(L) + " " +
-                         std::to_string(B) + " " + std::to_string(M) + " " +
-                         std::to_string(num_threads) + " " + std::to_string(disk_PQ) + " " +
-                         std::to_string(append_reorder_data) + " " + std::to_string(build_PQ) + " " +
-                         std::to_string(QD);
+    std::ostringstream params_oss;
+    params_oss << ds_cfg.diskann_R << " " << ds_cfg.diskann_L_build << " "
+               << ds_cfg.search_dram_budget_gb << " " << ds_cfg.build_dram_budget_gb << " "
+               << ds_cfg.threads << " " << disk_PQ << " "
+               << append_reorder_data << " " << build_PQ << " " << QD;
+    std::string params = params_oss.str();
 
     std::cout << "\n[Building DiskANN disk index...]" << std::endl;
     std::cout << "Data file: " << bin_path << std::endl;

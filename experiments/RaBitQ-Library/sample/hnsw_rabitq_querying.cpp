@@ -5,10 +5,9 @@
 #include "rabitqlib/utils/io.hpp"
 #include "rabitqlib/utils/stopw.hpp"
 
-std::vector<size_t> efs = {10,  20,  40,  50,  60,  80,  100, 150,  170,  190, 200,
-                           250, 300, 400, 500, 600, 700, 800, 1000, 1500, 2000};
+std::vector<size_t> efs = {10,  20,  40,  50,  60,  80,  100, 150,  170,  190, 200};
 
-size_t test_round = 3;
+size_t test_round = 1;
 size_t topk = 10;
 
 using PID = rabitqlib::PID;
@@ -73,7 +72,7 @@ int main(int argc, char* argv[]) {
             auto start = std::chrono::high_resolution_clock::now();
 
             std::vector<std::vector<std::pair<float, PID>>> res =
-                hnsw.search(query.data(), nq, topk, ef, 1);
+                hnsw.search(query.data(), nq, topk, ef, 16);
 
             auto end = std::chrono::high_resolution_clock::now();
 

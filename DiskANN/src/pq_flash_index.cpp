@@ -1333,9 +1333,15 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     uint8_t *pq_coord_scratch = pq_query_scratch->aligned_pq_coord_scratch;
     float *pq_dists = pq_query_scratch->aligned_pqtable_dist_scratch;
 
-    // FAISS distance computer (thread-local, created per query if using FAISS)
-    std::unique_ptr<faiss::FlatCodesDistanceComputer> faiss_dc;
-    if (_use_faiss_quantization)
+    // Distance computer (thread-local, created per query)
+    // Supports both FlatCodes-based FAISS indices and generic DistanceComputer factories
+    std::unique_ptr<faiss::DistanceComputer> faiss_dc;
+    if (_use_dc_factory)
+    {
+        faiss_dc = _dc_factory();
+        faiss_dc->set_query(query_float);
+    }
+    else if (_use_faiss_quantization)
     {
         faiss_dc.reset(_faiss_index->get_FlatCodesDistanceComputer());
         faiss_dc->set_query(query_float);
@@ -1348,12 +1354,12 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     }
 
     // lambda to batch compute query<-> node distances
-    // Uses FAISS distance computer if available, otherwise falls back to PQ
+    // Uses DistanceComputer if available (FAISS or generic factory), otherwise falls back to PQ
     auto compute_dists = [this, pq_coord_scratch, pq_dists, &faiss_dc](const uint32_t *ids, const uint64_t n_ids,
                                                                         float *dists_out) {
-        if (this->_use_faiss_quantization)
+        if (this->_use_dc_factory || this->_use_faiss_quantization)
         {
-            // Use FAISS distance computer with batch optimization
+            // Use distance computer with batch optimization
             uint64_t i = 0;
             // Process in batches of 4 for SIMD optimization
             for (; i + 4 <= n_ids; i += 4)
@@ -1811,10 +1817,28 @@ void PQFlashIndex<T, LabelT>::set_faiss_index(faiss::IndexFlatCodes *faiss_index
 {
     _faiss_index = faiss_index;
     _use_faiss_quantization = (faiss_index != nullptr);
+    // Clear generic factory (mutually exclusive)
     if (_use_faiss_quantization)
     {
+        _dc_factory = nullptr;
+        _use_dc_factory = false;
         diskann::cout << "PQFlashIndex: Using FAISS quantization for distance estimation "
                       << "(code_size=" << faiss_index->code_size << ", ntotal=" << faiss_index->ntotal << ")"
+                      << std::endl;
+    }
+}
+
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::set_distance_computer_factory(DCFactory factory)
+{
+    _dc_factory = std::move(factory);
+    _use_dc_factory = (bool)_dc_factory;
+    // Clear FlatCodes-specific path (mutually exclusive)
+    if (_use_dc_factory)
+    {
+        _faiss_index = nullptr;
+        _use_faiss_quantization = false;
+        diskann::cout << "PQFlashIndex: Using generic distance computer factory for distance estimation"
                       << std::endl;
     }
 }

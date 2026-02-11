@@ -6,129 +6,156 @@
  */
 
 /**
- * Build HNSW index on SIFT1M dataset with exact distances.
+ * Build HNSW index on a dataset, reading parameters from datasets.conf.
  *
  * Usage:
- *   ./build_hnsw_index [data_path] [M] [efConstruction]
+ *   ./build_hnsw_index --dataset <name> [options]
  *
- * Default:
- *   data_path: /data/local/embedding_dataset/sift1M
- *   M: 32
- *   efConstruction: 200
+ * Options:
+ *   --dataset <name>       Dataset name (e.g., sift1m, gist1m)
+ *   --config-dir <path>    Config directory (default: ./config)
+ *   --data-path <path>     Override dataset base path
+ *   --M <n>                Override HNSW M parameter
+ *   --efConstruction <n>   Override HNSW efConstruction parameter
+ *   --help                 Show this help
  *
  * Output files stored in:
- *   /data/local/embedding_dataset/sift1M/index/hnsw_M{M}_ef{efConstruction}.faissindex
+ *   <base_path>/index/hnsw_M{M}_ef{efConstruction}.faissindex
  */
 
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 #include <string>
-#include <sys/stat.h>
 
 #include <faiss/IndexHNSW.h>
 #include <faiss/index_io.h>
 
-/*****************************************************
- * I/O functions for fvecs
- *****************************************************/
+#include "include/bench_config.h"
+#include "include/bench_utils.h"
 
-float* fvecs_read(const char* fname, size_t* d_out, size_t* n_out) {
-    FILE* f = fopen(fname, "r");
-    if (!f) {
-        fprintf(stderr, "could not open %s\n", fname);
-        perror("");
-        abort();
-    }
-    int d;
-    fread(&d, 1, sizeof(int), f);
-    assert((d > 0 && d < 1000000) || !"unreasonable dimension");
-    fseek(f, 0, SEEK_SET);
-    struct stat st;
-    fstat(fileno(f), &st);
-    size_t sz = st.st_size;
-    assert(sz % ((d + 1) * 4) == 0 || !"weird file size");
-    size_t n = sz / ((d + 1) * 4);
-
-    *d_out = d;
-    *n_out = n;
-    float* x = new float[n * (d + 1)];
-    size_t nr __attribute__((unused)) = fread(x, sizeof(float), n * (d + 1), f);
-    assert(nr == n * (d + 1) || !"could not read whole file");
-
-    // shift array to remove row headers
-    for (size_t i = 0; i < n; i++)
-        memmove(x + i * d, x + 1 + i * (d + 1), d * sizeof(*x));
-
-    fclose(f);
-    return x;
-}
+using namespace hnsw_bench;
 
 /*****************************************************
- * Timing utilities
+ * Command line parsing
  *****************************************************/
 
-class Timer {
-   public:
-    Timer() : start_(std::chrono::high_resolution_clock::now()) {}
-
-    void reset() { start_ = std::chrono::high_resolution_clock::now(); }
-
-    double elapsed_ms() const {
-        auto end = std::chrono::high_resolution_clock::now();
-        return std::chrono::duration<double, std::milli>(end - start_).count();
-    }
-
-   private:
-    std::chrono::high_resolution_clock::time_point start_;
+struct Options {
+    std::string dataset = "sift1m";
+    std::string config_dir = "./config";
+    std::string data_path;  // override
+    int M = -1;             // -1 = use config
+    int efConstruction = -1;
+    bool help = false;
 };
 
-void create_directory(const std::string& path) {
-    std::string cmd = "mkdir -p " + path;
-    int ret = system(cmd.c_str());
-    (void)ret;
+void print_usage(const char* prog) {
+    std::cout << "Usage: " << prog << " --dataset <name> [options]\n\n"
+              << "Options:\n"
+              << "  --dataset <name>       Dataset name (e.g., sift1m, gist1m)\n"
+              << "  --config-dir <path>    Config directory (default: ./config)\n"
+              << "  --data-path <path>     Override dataset base path\n"
+              << "  --M <n>               Override HNSW M parameter\n"
+              << "  --efConstruction <n>   Override HNSW efConstruction parameter\n"
+              << "  --help                 Show this help\n\n"
+              << "Example:\n"
+              << "  " << prog << " --dataset sift1m\n"
+              << "  " << prog << " --dataset gist1m --M 48 --efConstruction 300\n";
 }
 
-int main(int argc, char* argv[]) {
-    std::string data_path = "/data/local/embedding_dataset/sift1M";
-    int M = 32;
-    int efConstruction = 200;
+Options parse_args(int argc, char** argv) {
+    Options opts;
 
-    if (argc > 1) {
-        data_path = argv[1];
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            opts.help = true;
+        } else if (arg == "--dataset" && i + 1 < argc) {
+            opts.dataset = argv[++i];
+        } else if (arg == "--config-dir" && i + 1 < argc) {
+            opts.config_dir = argv[++i];
+        } else if (arg == "--data-path" && i + 1 < argc) {
+            opts.data_path = argv[++i];
+        } else if (arg == "--M" && i + 1 < argc) {
+            opts.M = std::stoi(argv[++i]);
+        } else if (arg == "--efConstruction" && i + 1 < argc) {
+            opts.efConstruction = std::stoi(argv[++i]);
+        }
     }
-    if (argc > 2) {
-        M = std::atoi(argv[2]);
+
+    return opts;
+}
+
+/*****************************************************
+ * Main
+ *****************************************************/
+
+int main(int argc, char** argv) {
+    Options opts = parse_args(argc, argv);
+
+    if (opts.help) {
+        print_usage(argv[0]);
+        return 0;
     }
-    if (argc > 3) {
-        efConstruction = std::atoi(argv[3]);
+
+    // Load dataset config
+    std::string datasets_config = opts.config_dir + "/datasets.conf";
+    auto dataset_configs = ConfigParser::parse_datasets(datasets_config);
+
+    DatasetConfig ds_cfg;
+    auto it = dataset_configs.find(opts.dataset);
+    if (it != dataset_configs.end()) {
+        ds_cfg = it->second;
+    } else {
+        std::cerr << "Warning: Dataset '" << opts.dataset
+                  << "' not found in " << datasets_config
+                  << ", using defaults" << std::endl;
+        ds_cfg.name = opts.dataset;
+        ds_cfg.base_path = "/data/local/embedding_dataset/" + opts.dataset;
+    }
+
+    // Apply command line overrides
+    if (!opts.data_path.empty()) {
+        ds_cfg.base_path = opts.data_path;
+    }
+    if (opts.M > 0) {
+        ds_cfg.hnsw_M = opts.M;
+    }
+    if (opts.efConstruction > 0) {
+        ds_cfg.hnsw_efConstruction = opts.efConstruction;
     }
 
     std::cout << "==================================================" << std::endl;
     std::cout << "HNSW Index Builder (Exact Distances)" << std::endl;
-    std::cout << "Data path: " << data_path << std::endl;
-    std::cout << "M: " << M << std::endl;
-    std::cout << "efConstruction: " << efConstruction << std::endl;
+    std::cout << "Dataset: " << opts.dataset << std::endl;
+    std::cout << "Data path: " << ds_cfg.base_path << std::endl;
+    std::cout << "M: " << ds_cfg.hnsw_M << std::endl;
+    std::cout << "efConstruction: " << ds_cfg.hnsw_efConstruction << std::endl;
     std::cout << "==================================================" << std::endl;
 
     // Load data
     std::cout << "\n[Loading data...]" << std::endl;
     size_t d, nb;
-    float* xb = fvecs_read((data_path + "/sift_base.fvecs").c_str(), &d, &nb);
+    float* xb = fvecs_read(ds_cfg.get_path(ds_cfg.base_file).c_str(), &d, &nb);
+    if (!xb) {
+        std::cerr << "Error: Failed to load data from "
+                  << ds_cfg.get_path(ds_cfg.base_file) << std::endl;
+        return 1;
+    }
     std::cout << "Database: " << nb << " vectors, dimension " << d << std::endl;
 
     // Create index directory
-    std::string index_dir = data_path + "/index";
+    std::string index_dir = ds_cfg.base_path + "/index";
     create_directory(index_dir);
 
     // Build HNSW index
     std::cout << "\n[Building HNSW index...]" << std::endl;
     Timer timer;
 
-    faiss::IndexHNSWFlat index(d, M, faiss::METRIC_L2);
-    index.hnsw.efConstruction = efConstruction;
+    faiss::IndexHNSWFlat index(d, ds_cfg.hnsw_M, faiss::METRIC_L2);
+    index.hnsw.efConstruction = ds_cfg.hnsw_efConstruction;
 
     index.add(nb, xb);
 
@@ -136,8 +163,13 @@ int main(int argc, char* argv[]) {
     std::cout << "Build time: " << build_time / 1000.0 << " seconds" << std::endl;
 
     // Save index
-    std::string index_path = index_dir + "/hnsw_M" + std::to_string(M) +
-                             "_ef" + std::to_string(efConstruction) + ".faissindex";
+    std::string index_path = ds_cfg.get_hnsw_index_path();
+
+    // Create subdirectory if needed
+    size_t last_slash = index_path.rfind('/');
+    if (last_slash != std::string::npos) {
+        create_directory(index_path.substr(0, last_slash));
+    }
 
     std::cout << "\n[Saving index to " << index_path << "...]" << std::endl;
     timer.reset();

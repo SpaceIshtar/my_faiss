@@ -83,7 +83,7 @@ public:
         code_size_ = bin_data_size_ + ex_data_size_;
 
         // Initialize config
-        config_ = rabitqlib::quant::faster_config(padded_dim_, total_bits);
+        config_ = rabitqlib::quant::faster_config(padded_dim_, rabitqlib::SplitSingleQuery<float>::kNumBits);
 
         // Select IP function for extra bits
         ip_func_ = rabitqlib::select_excode_ipfunc(ex_bits_);
@@ -211,10 +211,16 @@ struct SearchResult {
     }
 };
 
+struct QueryStats1{
+    size_t nhops = 0;
+    size_t ndis1 = 0;
+    size_t ndis2 = 0;
+};
+
 using MinHeap = std::priority_queue<SearchResult, std::vector<SearchResult>, std::greater<SearchResult>>;
 using MaxHeap = std::priority_queue<SearchResult>;
 
-QueryStats rabitq_native_search(
+QueryStats1 rabitq_native_search(
         const faiss::HNSW& hnsw,
         const faiss::IndexHNSW* hnsw_index,
         const RaBitQIndex* rabitq,
@@ -226,7 +232,7 @@ QueryStats rabitq_native_search(
         bool do_rerank,
         faiss::DistanceComputer* exact_dc) {
 
-    QueryStats stats;
+    QueryStats1 stats;
     size_t padded_dim = rabitq->padded_dim();
     size_t ex_bits = rabitq->ex_bits();
     size_t num_clusters = rabitq->num_clusters();
@@ -277,11 +283,11 @@ QueryStats rabitq_native_search(
         rabitqlib::split_single_estdist(
             bin_data, query_wrapper, padded_dim,
             ip_x0_qr, est_dist, low_dist, g_add, g_error);
-        stats.ndis++;
+        stats.ndis1++;
     };
 
     // Get full estimate with extra bits
-    auto get_full_estimate = [&](faiss::idx_t id, float ip_x0_qr, float& est_dist, float& low_dist) {
+    auto get_full_estimate = [&](faiss::idx_t id, float& ip_x0_qr, float& est_dist, float& low_dist) {
         const char* code = rabitq->get_code(id);
         const char* bin_data = code;
         const char* ex_data = code + rabitq->bin_data_size();
@@ -293,17 +299,20 @@ QueryStats rabitq_native_search(
         rabitqlib::split_single_fulldist(
             bin_data, ex_data, rabitq->ip_func(), query_wrapper, padded_dim,
             ex_bits, est_dist, low_dist, ip_x0_qr, g_add, g_error);
-        stats.ndis++;
+        stats.ndis2++;
     };
 
     float ep_est, ep_low, ep_ip;
     get_estimate(ep, ep_est, ep_low, ep_ip);
+    // std::cout << "ep = " << ep << ", ep_est = " << ep_est << ", ep_low = " << ep_low << std::endl;
     if (ex_bits > 0) {
         get_full_estimate(ep, ep_ip, ep_est, ep_low);
     }
+    // std::cout << "ep = " << ep << ", ep_est = " << ep_est << ", ep_low = " << ep_low << std::endl;
 
     // Search upper levels (greedy)
     for (int level = hnsw.max_level; level > 0; level--) {
+        // std::cout << level << std::endl;
         bool changed = true;
         while (changed) {
             changed = false;
@@ -316,11 +325,11 @@ QueryStats rabitq_native_search(
 
                 float n_est, n_low, n_ip;
                 get_estimate(neighbor, n_est, n_low, n_ip);
-
+                // std::cout << "neighbor = " << neighbor << ", est = " << n_est << ", low = " << n_low << std::endl;
                 if (n_est < ep_est) {
-                    if (ex_bits > 0) {
-                        get_full_estimate(neighbor, n_ip, n_est, n_low);
-                    }
+                    // if (ex_bits > 0) {
+                    //     get_full_estimate(neighbor, n_ip, n_est, n_low);
+                    // }
                     if (n_est < ep_est) {
                         ep = neighbor;
                         ep_est = n_est;
@@ -437,12 +446,40 @@ QueryStats rabitq_native_search(
  * Benchmark runner
  *****************************************************/
 
+struct SearchStats1 {
+    PercentileStats ndis1_stats;
+    PercentileStats ndis2_stats;
+    PercentileStats nhops_stats;
+
+    static SearchStats1 compute(const std::vector<QueryStats1>& query_stats) {
+        SearchStats1 result;
+        if (query_stats.empty()) return result;
+
+        std::vector<size_t> ndis1_values, ndis2_values, nhops_values;
+        ndis1_values.reserve(query_stats.size());
+        ndis2_values.reserve(query_stats.size());
+        nhops_values.reserve(query_stats.size());
+
+        for (const auto& qs : query_stats) {
+            ndis1_values.push_back(qs.ndis1);
+            ndis2_values.push_back(qs.ndis2);
+            nhops_values.push_back(qs.nhops);
+        }
+
+        result.ndis1_stats = compute_percentile_stats(ndis1_values);
+        result.ndis2_stats = compute_percentile_stats(ndis2_values);
+        result.nhops_stats = compute_percentile_stats(nhops_values);
+
+        return result;
+    }
+};
+
 struct BenchmarkResult {
     size_t ef;
     double qps;
     float recall;
     double latency_ms;
-    SearchStats stats;
+    SearchStats1 stats;
 };
 
 std::vector<BenchmarkResult> run_benchmark(
@@ -466,7 +503,7 @@ std::vector<BenchmarkResult> run_benchmark(
     for (size_t ef : ef_values) {
         std::vector<faiss::idx_t> result_ids(nq * k, -1);
         std::vector<float> result_dists(nq * k, std::numeric_limits<float>::max());
-        std::vector<QueryStats> query_stats(nq);
+        std::vector<QueryStats1> query_stats(nq);
 
         // Timed search
         timer.reset();
@@ -493,7 +530,7 @@ std::vector<BenchmarkResult> run_benchmark(
         double qps = nq * 1000.0 / search_time;
         double latency = search_time / nq;
         float recall = compute_recall_at_k(nq, k, result_ids.data(), gt, gt_k);
-        SearchStats stats = SearchStats::compute(query_stats);
+        SearchStats1 stats = SearchStats1::compute(query_stats);
 
         results.push_back({ef, qps, recall, latency, stats});
 
@@ -501,7 +538,8 @@ std::vector<BenchmarkResult> run_benchmark(
                   << std::setw(12) << std::fixed << std::setprecision(0) << qps
                   << std::setw(12) << std::setprecision(4) << recall
                   << std::setw(12) << std::setprecision(3) << latency
-                  << std::setw(12) << std::setprecision(1) << stats.ndis_stats.mean
+                  << std::setw(12) << std::setprecision(1) << stats.ndis1_stats.mean
+                  << std::setw(12) << std::setprecision(1) << stats.ndis2_stats.mean
                   << std::setw(12) << std::setprecision(1) << stats.nhops_stats.mean
                   << std::endl;
     }
@@ -573,6 +611,104 @@ Options parse_args(int argc, char** argv) {
 }
 
 /*****************************************************
+ * Result file output
+ *****************************************************/
+
+void print_percentile_stats(std::ostream& os, const std::string& name, const PercentileStats& stats) {
+    os << "  " << name << ":\n"
+       << "    min:      " << std::fixed << std::setprecision(2) << stats.min << "\n"
+       << "    p10:      " << stats.p10 << "\n"
+       << "    p25:      " << stats.p25 << "\n"
+       << "    p50:      " << stats.p50 << "\n"
+       << "    p75:      " << stats.p75 << "\n"
+       << "    p90:      " << stats.p90 << "\n"
+       << "    max:      " << stats.max << "\n"
+       << "    mean:     " << stats.mean << "\n"
+       << "    variance: " << stats.variance << "\n"
+       << "    stddev:   " << stats.stddev << "\n";
+}
+
+void save_results_to_file(
+        const std::string& filepath,
+        const std::string& dataset_name,
+        const std::string& quant_params,
+        int hnsw_M,
+        int hnsw_efConstruction,
+        size_t nq,
+        size_t k,
+        const std::vector<BenchmarkResult>& results) {
+
+
+    std::ofstream ofs(filepath);
+    if (!ofs.is_open()) {
+        std::cerr << "Error: Could not open file for writing: " << filepath << std::endl;
+        return;
+    }
+
+    // Header
+    ofs << "========================================\n"
+        << "HNSW + Quantization Benchmark Results\n"
+        << "========================================\n\n";
+
+    // Configuration
+    ofs << "[Configuration]\n"
+        << "  Dataset:           " << dataset_name << "\n"
+        << "  Algorithm:         " << "RaBitQ-Native" << "\n"
+        << "  Quant Params:      " << quant_params << "\n"
+        << "  HNSW M:            " << hnsw_M << "\n"
+        << "  HNSW efConstruct:  " << hnsw_efConstruction << "\n"
+        << "  Num Queries:       " << nq << "\n"
+        << "  Recall@k:          " << k << "\n\n";
+
+    // Summary table
+    ofs << "[Summary]\n"
+        << std::setw(8) << "ef"
+        << std::setw(12) << "QPS"
+        << std::setw(12) << "Recall"
+        << std::setw(12) << "Latency(ms)"
+        << std::setw(12) << "ndis1_mean"
+        << std::setw(12) << "ndis2_mean"
+        << std::setw(12) << "nhops_mean"
+        << "\n"
+        << std::string(68, '-') << "\n";
+
+    for (const auto& r : results) {
+        ofs << std::setw(8) << r.ef
+            << std::setw(12) << std::fixed << std::setprecision(0) << r.qps
+            << std::setw(12) << std::setprecision(4) << r.recall
+            << std::setw(12) << std::setprecision(3) << r.latency_ms
+            << std::setw(12) << std::setprecision(1) << r.stats.ndis1_stats.mean
+            << std::setw(12) << std::setprecision(1) << r.stats.ndis2_stats.mean
+            << std::setw(12) << std::setprecision(1) << r.stats.nhops_stats.mean
+            << "\n";
+    }
+    ofs << "\n";
+
+    // Detailed statistics for each ef value
+    ofs << "[Detailed Statistics]\n";
+    for (const auto& r : results) {
+        ofs << "\n--- ef = " << r.ef << " ---\n"
+            << "  QPS:          " << std::fixed << std::setprecision(2) << r.qps << "\n"
+            << "  Recall@" << k << ":    " << std::setprecision(4) << r.recall << "\n"
+            << "  Total Time:   " << std::setprecision(2) << -1 << " ms\n"
+            << "  Avg Latency:  " << std::setprecision(4) << r.latency_ms << " ms\n\n";
+
+        print_percentile_stats(ofs, "ndis (distance computations)", r.stats.ndis1_stats);
+        ofs << "\n";
+        print_percentile_stats(ofs, "ndis (distance computations)", r.stats.ndis2_stats);
+        ofs << "\n";
+        print_percentile_stats(ofs, "nhops (graph edges traversed)", r.stats.nhops_stats);
+    }
+
+    ofs << "\n========================================\n"
+        << "End of Results\n"
+        << "========================================\n";
+
+    ofs.close();
+    std::cout << "Results saved to: " << filepath << std::endl;
+}
+
+/*****************************************************
  * Main
  *****************************************************/
 
@@ -620,6 +756,20 @@ int main(int argc, char** argv) {
         ds_cfg.ef_search_values = get_default_ef_search();
     }
 
+    std::string algo_config = opts.config_dir + "/rabitq.conf";
+    auto algo_params = ConfigParser::parse_algorithm(algo_config);
+
+    std::vector<AlgorithmParamSet> param_sets;
+    auto ait = algo_params.find(opts.dataset);
+    if (ait != algo_params.end()) {
+        param_sets = ait->second;
+    }
+    else{
+        std::cerr << "cannot find corresponding dataset " << std::endl;
+        exit(-1);
+    }
+
+
     omp_set_num_threads(ds_cfg.threads);
     std::cout << "Data path: " << ds_cfg.base_path << std::endl;
     std::cout << "Threads: " << ds_cfg.threads << std::endl;
@@ -655,60 +805,92 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Build RaBitQ index
-    std::cout << "\n[Building RaBitQ index (bits=" << opts.total_bits << ")...]" << std::endl;
-    Timer timer;
-    RaBitQIndex rabitq(d, opts.total_bits);
-    rabitq.add(nb, xb);
-    std::cout << "RaBitQ build time: " << timer.elapsed_ms() << " ms" << std::endl;
-
-    // Run benchmark
-    std::cout << "\n" << std::setw(8) << "ef"
-              << std::setw(12) << "QPS"
-              << std::setw(12) << "Recall@" << ds_cfg.k
-              << std::setw(12) << "Latency(ms)"
-              << std::setw(12) << "ndis_mean"
-              << std::setw(12) << "nhops_mean" << std::endl;
-    std::cout << std::string(68, '-') << std::endl;
-
-    auto results = run_benchmark(
-        hnsw_index, flat_index, &rabitq,
-        xq, nq, d, gt, gt_k, ds_cfg.k,
-        ds_cfg.ef_search_values, ds_cfg.threads, opts.rerank);
-
-    // Save results
-    std::string result_dir = "experiments/hnsw/results/" + opts.dataset + "/rabitq_native";
-    create_directory(result_dir);
-    std::string suffix = opts.rerank ? "_rerank" : "";
-    std::string result_file = result_dir + "/bits" + std::to_string(opts.total_bits) +
-        "_c16" + suffix +
-        "_M" + std::to_string(ds_cfg.hnsw_M) +
-        "_efc" + std::to_string(ds_cfg.hnsw_efConstruction) + ".txt";
-
-    std::ofstream ofs(result_file);
-    if (ofs.is_open()) {
-        ofs << "# RaBitQ Native Search Benchmark\n"
-            << "# Dataset: " << opts.dataset << "\n"
-            << "# Total bits: " << opts.total_bits << "\n"
-            << "# Rerank: " << (opts.rerank ? "yes" : "no") << "\n"
-            << "# HNSW M: " << ds_cfg.hnsw_M << ", efConstruction: " << ds_cfg.hnsw_efConstruction << "\n\n"
-            << std::setw(8) << "ef"
-            << std::setw(12) << "QPS"
-            << std::setw(12) << "Recall"
-            << std::setw(12) << "Latency(ms)"
-            << std::setw(12) << "ndis_mean"
-            << std::setw(12) << "nhops_mean" << "\n";
-
-        for (const auto& r : results) {
-            ofs << std::setw(8) << r.ef
-                << std::setw(12) << std::fixed << std::setprecision(0) << r.qps
-                << std::setw(12) << std::setprecision(4) << r.recall
-                << std::setw(12) << std::setprecision(3) << r.latency_ms
-                << std::setw(12) << std::setprecision(1) << r.stats.ndis_stats.mean
-                << std::setw(12) << std::setprecision(1) << r.stats.nhops_stats.mean << "\n";
+    for (const auto& parameters: param_sets){
+        size_t total_bits = 4;  // default: 1-bit + 3 extra bits
+        size_t num_clusters = 16;  // default as in RaBitQ paper
+        
+        // Also accept "bits" as parameter name
+        auto it = parameters.params.find("bits");
+        if (it != parameters.params.end()) {
+            total_bits = std::stoul(it->second);
         }
-        ofs.close();
-        std::cout << "\nResults saved to: " << result_file << std::endl;
+        else{
+            std::cerr << "bits needed to be set in conf" << std::endl;
+            exit(-1);
+        }
+
+        it = parameters.params.find("clusters");
+        if (it != parameters.params.end()) {
+            num_clusters = std::stoul(it->second);
+        }
+        else{
+            std::cerr << "clusters needed to be set in conf" << std::endl;
+            exit(-1);
+        }
+        // Build RaBitQ index
+        std::cout << "\n[Building RaBitQ index (bits=" << total_bits << ", ncluster=" << num_clusters << ")...]" << std::endl;
+        Timer timer;
+        RaBitQIndex rabitq(d, total_bits, num_clusters);
+        rabitq.add(nb, xb);
+        std::cout << "RaBitQ build time: " << timer.elapsed_ms() << " ms" << std::endl;
+
+        // Run benchmark
+        std::cout << "\n" << std::setw(8) << "ef"
+                << std::setw(12) << "QPS"
+                << std::setw(12) << "Recall@" << ds_cfg.k
+                << std::setw(12) << "Latency(ms)"
+                << std::setw(12) << "ndis1_mean"
+                << std::setw(12) << "ndis2_mean"
+                << std::setw(12) << "nhops_mean" << std::endl;
+        std::cout << std::string(68, '-') << std::endl;
+
+        auto results = run_benchmark(
+            hnsw_index, flat_index, &rabitq,
+            xq, nq, d, gt, gt_k, ds_cfg.k,
+            ds_cfg.ef_search_values, ds_cfg.threads, opts.rerank);
+
+        // Save results
+        std::string result_dir = "experiments/hnsw/results/" + opts.dataset + "/rabitq_native";
+        create_directory(result_dir);
+        std::string suffix = opts.rerank ? "_rerank" : "";
+        std::string result_file = result_dir + "/rabitq_native_bits" + std::to_string(total_bits) +
+            "_c" + std::to_string(num_clusters) + suffix +
+            "_M" + std::to_string(ds_cfg.hnsw_M) +
+            "_efc" + std::to_string(ds_cfg.hnsw_efConstruction) + ".txt";
+
+        save_results_to_file(
+            result_file, opts.dataset, parameters.to_string(),
+            ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction,
+            nq, ds_cfg.k, results);
+
+        // std::ofstream ofs(result_file);
+        // if (ofs.is_open()) {
+        //     ofs << "# RaBitQ Native Search Benchmark\n"
+        //         << "# Dataset: " << opts.dataset << "\n"
+        //         << "# Total bits: " << opts.total_bits << "\n"
+        //         << "# Rerank: " << (opts.rerank ? "yes" : "no") << "\n"
+        //         << "# HNSW M: " << ds_cfg.hnsw_M << ", efConstruction: " << ds_cfg.hnsw_efConstruction << "\n\n"
+        //         << std::setw(8) << "ef"
+        //         << std::setw(12) << "QPS"
+        //         << std::setw(12) << "Recall"
+        //         << std::setw(12) << "Latency(ms)"
+        //         << std::setw(12) << "ndis1_mean"
+        //         << std::setw(12) << "ndis2_mean"
+        //         << std::setw(12) << "nhops_mean" << "\n";
+
+        //     for (const auto& r : results) {
+        //         ofs << std::setw(8) << r.ef
+        //             << std::setw(12) << std::fixed << std::setprecision(0) << r.qps
+        //             << std::setw(12) << std::setprecision(4) << r.recall
+        //             << std::setw(12) << std::setprecision(3) << r.latency_ms
+        //             << std::setw(12) << std::setprecision(1) << r.stats.ndis1_stats.mean
+        //             << std::setw(12) << std::setprecision(1) << r.stats.ndis2_stats.mean
+        //             << std::setw(12) << std::setprecision(1) << r.stats.nhops_stats.mean << "\n";
+        //     }
+
+        //     ofs.close();
+        //     std::cout << "\nResults saved to: " << result_file << std::endl;
+        // }
     }
 
     std::cout << "\nTotal time: " << std::fixed << std::setprecision(1)

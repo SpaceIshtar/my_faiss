@@ -8,110 +8,103 @@
 /**
  * Benchmark standard HNSW with exact distances.
  *
+ * This benchmark tests HNSW's built-in exact distance computation
+ * (no custom quantizer), serving as a baseline for comparison with
+ * bench_hnsw_quant (custom quantizers).
+ *
  * Usage:
- *   ./bench_hnsw_standard [data_path] [index_path]
+ *   ./bench_hnsw_standard --dataset <name> [options]
+ *
+ * Options:
+ *   --dataset <name>       Dataset name (e.g., sift1m, gist1M)
+ *   --config-dir <path>    Config directory (default: ./config)
+ *   --data-path <path>     Override dataset base path
+ *   --threads <n>          Number of threads
+ *   --ef <list>            Comma-separated ef values to test
+ *   --help                 Show this help
+ *
+ * Example:
+ *   ./bench_hnsw_standard --dataset sift1m
+ *   ./bench_hnsw_standard --dataset gist1M --ef 10,20,50,100,200
  */
 
 #include <algorithm>
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include <omp.h>
-#include <sys/stat.h>
 
 #include <faiss/IndexHNSW.h>
+#include <faiss/impl/HNSW.h>
 #include <faiss/index_io.h>
 
-/*****************************************************
- * I/O functions for fvecs and ivecs
- *****************************************************/
+#include "include/bench_config.h"
+#include "include/bench_utils.h"
 
-float* fvecs_read(const char* fname, size_t* d_out, size_t* n_out) {
-    FILE* f = fopen(fname, "r");
-    if (!f) {
-        fprintf(stderr, "could not open %s\n", fname);
-        perror("");
-        abort();
-    }
-    int d;
-    fread(&d, 1, sizeof(int), f);
-    assert((d > 0 && d < 1000000) || !"unreasonable dimension");
-    fseek(f, 0, SEEK_SET);
-    struct stat st;
-    fstat(fileno(f), &st);
-    size_t sz = st.st_size;
-    assert(sz % ((d + 1) * 4) == 0 || !"weird file size");
-    size_t n = sz / ((d + 1) * 4);
-
-    *d_out = d;
-    *n_out = n;
-    float* x = new float[n * (d + 1)];
-    size_t nr __attribute__((unused)) = fread(x, sizeof(float), n * (d + 1), f);
-    assert(nr == n * (d + 1) || !"could not read whole file");
-
-    for (size_t i = 0; i < n; i++)
-        memmove(x + i * d, x + 1 + i * (d + 1), d * sizeof(*x));
-
-    fclose(f);
-    return x;
-}
-
-int* ivecs_read(const char* fname, size_t* d_out, size_t* n_out) {
-    return (int*)fvecs_read(fname, d_out, n_out);
-}
+using namespace hnsw_bench;
 
 /*****************************************************
- * Timing utilities
+ * Command line parsing
  *****************************************************/
 
-class Timer {
-   public:
-    Timer() : start_(std::chrono::high_resolution_clock::now()) {}
-    void reset() { start_ = std::chrono::high_resolution_clock::now(); }
-    double elapsed_ms() const {
-        auto end = std::chrono::high_resolution_clock::now();
-        return std::chrono::duration<double, std::milli>(end - start_).count();
-    }
-
-   private:
-    std::chrono::high_resolution_clock::time_point start_;
+struct Options {
+    std::string dataset = "sift1m";
+    std::string config_dir = "./config";
+    std::string data_path;        // override
+    int threads = -1;             // -1 = use config
+    std::vector<size_t> ef_values;
+    bool help = false;
 };
 
-/*****************************************************
- * Recall computation
- *****************************************************/
+void print_usage(const char* prog) {
+    std::cout << "Usage: " << prog << " --dataset <name> [options]\n\n"
+              << "Options:\n"
+              << "  --dataset <name>       Dataset name (e.g., sift1m, gist1M)\n"
+              << "  --config-dir <path>    Config directory (default: ./config)\n"
+              << "  --data-path <path>     Override dataset base path\n"
+              << "  --threads <n>          Number of threads\n"
+              << "  --ef <list>            Comma-separated ef values to test\n"
+              << "  --help                 Show this help\n\n"
+              << "Example:\n"
+              << "  " << prog << " --dataset sift1m\n"
+              << "  " << prog << " --dataset gist1M --ef 10,20,50,100,200\n";
+}
 
-float compute_recall_at_k(
-        size_t nq,
-        size_t k,
-        const faiss::idx_t* I,
-        const int* gt,
-        size_t gt_k) {
-    int64_t total_hits = 0;
-    for (size_t i = 0; i < nq; i++) {
-        for (size_t j = 0; j < k; j++) {
-            faiss::idx_t result_id = I[i * k + j];
-            for (size_t l = 0; l < k && l < gt_k; l++) {
-                if (result_id == (faiss::idx_t)gt[i * gt_k + l]) {
-                    total_hits++;
-                    break;
-                }
+Options parse_args(int argc, char** argv) {
+    Options opts;
+
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            opts.help = true;
+        } else if (arg == "--dataset" && i + 1 < argc) {
+            opts.dataset = argv[++i];
+        } else if (arg == "--config-dir" && i + 1 < argc) {
+            opts.config_dir = argv[++i];
+        } else if (arg == "--data-path" && i + 1 < argc) {
+            opts.data_path = argv[++i];
+        } else if (arg == "--threads" && i + 1 < argc) {
+            opts.threads = std::stoi(argv[++i]);
+        } else if (arg == "--ef" && i + 1 < argc) {
+            std::string ef_str = argv[++i];
+            std::istringstream iss(ef_str);
+            std::string token;
+            while (std::getline(iss, token, ',')) {
+                opts.ef_values.push_back(std::stoul(token));
             }
         }
     }
-    return total_hits / float(nq * k);
+
+    return opts;
 }
 
 /*****************************************************
- * Result storage
+ * Result structures
  *****************************************************/
 
 struct BenchmarkResult {
@@ -119,124 +112,203 @@ struct BenchmarkResult {
     double qps;
     float recall;
     double latency_ms;
+    double total_time_ms;
+    SearchStats stats;
 };
 
-void create_directory(const std::string& path) {
-    std::string cmd = "mkdir -p " + path;
-    system(cmd.c_str());
+/*****************************************************
+ * Result file output
+ *****************************************************/
+
+void print_percentile_stats(std::ostream& os, const std::string& name, const PercentileStats& stats) {
+    os << "  " << name << ":\n"
+       << "    min:      " << std::fixed << std::setprecision(2) << stats.min << "\n"
+       << "    p10:      " << stats.p10 << "\n"
+       << "    p25:      " << stats.p25 << "\n"
+       << "    p50:      " << stats.p50 << "\n"
+       << "    p75:      " << stats.p75 << "\n"
+       << "    p90:      " << stats.p90 << "\n"
+       << "    max:      " << stats.max << "\n"
+       << "    mean:     " << stats.mean << "\n"
+       << "    variance: " << stats.variance << "\n"
+       << "    stddev:   " << stats.stddev << "\n";
 }
 
-// Extract dataset name from path (e.g., "/data/local/embedding_dataset/sift1M" -> "sift1M")
-std::string get_dataset_name(const std::string& path) {
-    size_t pos = path.rfind('/');
-    if (pos != std::string::npos && pos + 1 < path.size()) {
-        return path.substr(pos + 1);
-    }
-    return path;
-}
+void save_results_to_file(
+        const std::string& filepath,
+        const std::string& dataset_name,
+        int hnsw_M,
+        int hnsw_efConstruction,
+        size_t nq,
+        size_t k,
+        const std::vector<BenchmarkResult>& results) {
 
-// Extract M and efConstruction from index path (e.g., "hnsw_M32_ef200.faissindex")
-std::pair<int, int> parse_index_params(const std::string& index_path) {
-    int M = 32, efC = 200;  // defaults
-
-    // Find "M" followed by digits
-    size_t m_pos = index_path.find("_M");
-    if (m_pos != std::string::npos) {
-        m_pos += 2;  // skip "_M"
-        size_t end = m_pos;
-        while (end < index_path.size() && std::isdigit(index_path[end])) end++;
-        if (end > m_pos) {
-            M = std::stoi(index_path.substr(m_pos, end - m_pos));
-        }
+    // Create directory if needed
+    size_t last_slash = filepath.rfind('/');
+    if (last_slash != std::string::npos) {
+        create_directory(filepath.substr(0, last_slash));
     }
 
-    // Find "ef" followed by digits
-    size_t ef_pos = index_path.find("_ef");
-    if (ef_pos != std::string::npos) {
-        ef_pos += 3;  // skip "_ef"
-        size_t end = ef_pos;
-        while (end < index_path.size() && std::isdigit(index_path[end])) end++;
-        if (end > ef_pos) {
-            efC = std::stoi(index_path.substr(ef_pos, end - ef_pos));
-        }
+    std::ofstream ofs(filepath);
+    if (!ofs.is_open()) {
+        std::cerr << "Error: Could not open file for writing: " << filepath << std::endl;
+        return;
     }
 
-    return {M, efC};
+    // Header
+    ofs << "========================================\n"
+        << "HNSW Standard Benchmark Results\n"
+        << "========================================\n\n";
+
+    // Configuration
+    ofs << "[Configuration]\n"
+        << "  Dataset:           " << dataset_name << "\n"
+        << "  Algorithm:         standard (exact distances)\n"
+        << "  HNSW M:            " << hnsw_M << "\n"
+        << "  HNSW efConstruct:  " << hnsw_efConstruction << "\n"
+        << "  Num Queries:       " << nq << "\n"
+        << "  Recall@k:          " << k << "\n\n";
+
+    // Summary table
+    ofs << "[Summary]\n"
+        << std::setw(8) << "ef"
+        << std::setw(12) << "QPS"
+        << std::setw(12) << "Recall"
+        << std::setw(12) << "Latency(ms)"
+        << std::setw(12) << "ndis_mean"
+        << std::setw(12) << "nhops_mean"
+        << "\n"
+        << std::string(68, '-') << "\n";
+
+    for (const auto& r : results) {
+        ofs << std::setw(8) << r.ef
+            << std::setw(12) << std::fixed << std::setprecision(0) << r.qps
+            << std::setw(12) << std::setprecision(4) << r.recall
+            << std::setw(12) << std::setprecision(3) << r.latency_ms
+            << std::setw(12) << std::setprecision(1) << r.stats.ndis_stats.mean
+            << std::setw(12) << std::setprecision(1) << r.stats.nhops_stats.mean
+            << "\n";
+    }
+    ofs << "\n";
+
+    // Detailed statistics for each ef value
+    ofs << "[Detailed Statistics]\n";
+    for (const auto& r : results) {
+        ofs << "\n--- ef = " << r.ef << " ---\n"
+            << "  QPS:          " << std::fixed << std::setprecision(2) << r.qps << "\n"
+            << "  Recall@" << k << ":    " << std::setprecision(4) << r.recall << "\n"
+            << "  Total Time:   " << std::setprecision(2) << r.total_time_ms << " ms\n"
+            << "  Avg Latency:  " << std::setprecision(4) << r.latency_ms << " ms\n\n";
+
+        print_percentile_stats(ofs, "ndis (distance computations)", r.stats.ndis_stats);
+        ofs << "\n";
+        print_percentile_stats(ofs, "nhops (graph edges traversed)", r.stats.nhops_stats);
+    }
+
+    ofs << "\n========================================\n"
+        << "End of Results\n"
+        << "========================================\n";
+
+    ofs.close();
+    std::cout << "Results saved to: " << filepath << std::endl;
 }
 
 /*****************************************************
  * Main
  *****************************************************/
 
-int main(int argc, char* argv[]) {
-    omp_set_num_threads(16);
+int main(int argc, char** argv) {
+    Options opts = parse_args(argc, argv);
 
-    std::string data_path = "/data/local/embedding_dataset/sift1M";
-    std::string index_path = "";
-
-    if (argc > 1) {
-        data_path = argv[1];
-    }
-    if (argc > 2) {
-        index_path = argv[2];
+    if (opts.help) {
+        print_usage(argv[0]);
+        return 0;
     }
 
-    if (index_path.empty()) {
-        index_path = data_path + "/index/hnsw_M32_ef200.faissindex";
+    // Load dataset config
+    std::string datasets_config = opts.config_dir + "/datasets.conf";
+    auto dataset_configs = ConfigParser::parse_datasets(datasets_config);
+
+    DatasetConfig ds_cfg;
+    auto it = dataset_configs.find(opts.dataset);
+    if (it != dataset_configs.end()) {
+        ds_cfg = it->second;
+    } else {
+        std::cerr << "Warning: Dataset '" << opts.dataset
+                  << "' not found in " << datasets_config
+                  << ", using defaults" << std::endl;
+        ds_cfg.name = opts.dataset;
+        ds_cfg.base_path = "/data/local/embedding_dataset/" + opts.dataset;
     }
+
+    // Apply command line overrides
+    if (!opts.data_path.empty()) {
+        ds_cfg.base_path = opts.data_path;
+    }
+    if (opts.threads > 0) {
+        ds_cfg.threads = opts.threads;
+    }
+    if (!opts.ef_values.empty()) {
+        ds_cfg.ef_search_values = opts.ef_values;
+    }
+    if (ds_cfg.ef_search_values.empty()) {
+        ds_cfg.ef_search_values = get_default_ef_search();
+    }
+
+    omp_set_num_threads(ds_cfg.threads);
 
     std::cout << "==================================================" << std::endl;
     std::cout << "Standard HNSW Benchmark (Exact Distances)" << std::endl;
-    std::cout << "Data path: " << data_path << std::endl;
-    std::cout << "Index path: " << index_path << std::endl;
-    std::cout << "Threads: " << omp_get_max_threads() << std::endl;
+    std::cout << "Dataset: " << opts.dataset << std::endl;
+    std::cout << "Data path: " << ds_cfg.base_path << std::endl;
+    std::cout << "HNSW M: " << ds_cfg.hnsw_M << std::endl;
+    std::cout << "HNSW efConstruction: " << ds_cfg.hnsw_efConstruction << std::endl;
+    std::cout << "Threads: " << ds_cfg.threads << std::endl;
     std::cout << "==================================================" << std::endl;
 
     Timer global_timer;
 
     // Load dataset
     std::cout << "\n[Loading data...]" << std::endl;
-    size_t d, nb, nq, k_gt;
-    float* xb = fvecs_read((data_path + "/sift_base.fvecs").c_str(), &d, &nb);
-    float* xq = fvecs_read((data_path + "/sift_query.fvecs").c_str(), &d, &nq);
-    int* gt = ivecs_read((data_path + "/sift_groundtruth.ivecs").c_str(), &k_gt, &nq);
+    size_t d, nb, nq, gt_k;
+    float* xb = fvecs_read(ds_cfg.get_path(ds_cfg.base_file).c_str(), &d, &nb);
+    float* xq = fvecs_read(ds_cfg.get_path(ds_cfg.query_file).c_str(), &d, &nq);
+    int* gt = ivecs_read(ds_cfg.get_path(ds_cfg.groundtruth_file).c_str(), &gt_k, &nq);
+
+    if (!xb || !xq || !gt) {
+        std::cerr << "Error: Failed to load data files" << std::endl;
+        return 1;
+    }
 
     std::cout << "Database: " << nb << " vectors, dimension " << d << std::endl;
     std::cout << "Queries: " << nq << " vectors" << std::endl;
 
-    // Load HNSW index
-    std::cout << "\n[Loading HNSW index...]" << std::endl;
-    Timer timer;
-    std::unique_ptr<faiss::Index> loaded_index(faiss::read_index(index_path.c_str()));
-    faiss::IndexHNSW* hnsw_index = dynamic_cast<faiss::IndexHNSW*>(loaded_index.get());
+    // Load or build HNSW index
+    std::string hnsw_path = ds_cfg.get_hnsw_index_path();
+    faiss::IndexHNSW* hnsw_index = load_or_build_hnsw(
+        hnsw_path, d, ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction, nb, xb);
+
     if (!hnsw_index) {
-        std::cerr << "Error: Index is not an IndexHNSW" << std::endl;
+        std::cerr << "Error: Failed to load/build HNSW index" << std::endl;
         return 1;
     }
-    std::cout << "HNSW load time: " << timer.elapsed_ms() << " ms" << std::endl;
 
-    // Parse HNSW parameters from index path
-    auto [hnsw_M, hnsw_efC] = parse_index_params(index_path);
-    std::string dataset_name = get_dataset_name(data_path);
-
-    // Search parameters
-    const size_t k = 10;
-    std::vector<size_t> ef_values = {10, 20, 30, 40, 50, 75, 100, 150, 200};
+    // Benchmark
+    const size_t k = ds_cfg.k;
     std::vector<BenchmarkResult> results;
 
-    // ==========================================
-    // Benchmark: Standard HNSW (exact distances)
-    // ==========================================
     std::cout << "\n==================================================" << std::endl;
-    std::cout << "Standard HNSW Search Results" << std::endl;
+    std::cout << "Standard HNSW Search Results (Exact Distances)" << std::endl;
     std::cout << "==================================================" << std::endl;
     std::cout << std::setw(8) << "ef"
-              << std::setw(15) << "QPS"
-              << std::setw(15) << "Recall@10"
-              << std::setw(15) << "Latency(ms)" << std::endl;
-    std::cout << std::string(53, '-') << std::endl;
+              << std::setw(12) << "QPS"
+              << std::setw(12) << "Recall@" << k
+              << std::setw(12) << "Latency(ms)"
+              << std::setw(12) << "ndis_mean"
+              << std::setw(12) << "nhops_mean" << std::endl;
+    std::cout << std::string(68, '-') << std::endl;
 
-    for (size_t ef : ef_values) {
+    for (size_t ef : ds_cfg.ef_search_values) {
         std::vector<faiss::idx_t> result_ids(nq * k);
         std::vector<float> result_dists(nq * k);
 
@@ -247,56 +319,55 @@ int main(int argc, char* argv[]) {
         hnsw_index->search(std::min((faiss::idx_t)100, (faiss::idx_t)nq),
                           xq, k, result_dists.data(), result_ids.data(), &params);
 
-        // Timed search
-        timer.reset();
+        // Timed search with stats collection
+        faiss::hnsw_stats.reset();
+        Timer timer;
         hnsw_index->search(nq, xq, k, result_dists.data(), result_ids.data(), &params);
 
         double search_time = timer.elapsed_ms();
         double qps = nq * 1000.0 / search_time;
         double latency = search_time / nq;
-        float recall = compute_recall_at_k(nq, k, result_ids.data(), gt, k_gt);
+        float recall = compute_recall_at_k(nq, k, result_ids.data(), gt, gt_k);
 
-        results.push_back({ef, qps, recall, latency});
+        // Collect ndis/nhop from HNSW global stats
+        // hnsw_stats accumulates totals across all queries; compute mean per query
+        SearchStats ss;
+        double mean_ndis = (double)faiss::hnsw_stats.ndis / nq;
+        double mean_nhops = (double)faiss::hnsw_stats.nhops / nq;
+        ss.ndis_stats.mean = mean_ndis;
+        ss.ndis_stats.p50 = mean_ndis;  // approximation (no per-query distribution)
+        ss.nhops_stats.mean = mean_nhops;
+        ss.nhops_stats.p50 = mean_nhops;
+
+        results.push_back({ef, qps, recall, latency, search_time, ss});
 
         std::cout << std::setw(8) << ef
-                  << std::setw(15) << std::fixed << std::setprecision(0) << qps
-                  << std::setw(15) << std::setprecision(4) << recall
-                  << std::setw(15) << std::setprecision(3) << latency << std::endl;
+                  << std::setw(12) << std::fixed << std::setprecision(0) << qps
+                  << std::setw(12) << std::setprecision(4) << recall
+                  << std::setw(12) << std::setprecision(3) << latency
+                  << std::setw(12) << std::setprecision(1) << ss.ndis_stats.mean
+                  << std::setw(12) << std::setprecision(1) << ss.nhops_stats.mean
+                  << std::endl;
     }
 
     // Save results to file
-    std::string result_dir = "experiments/hnsw/results/" + dataset_name + "/standard";
-    create_directory(result_dir);
-    std::string result_file = result_dir + "/M" + std::to_string(hnsw_M) +
-        "_efc" + std::to_string(hnsw_efC) + ".txt";
+    std::string result_filename = "standard_M" + std::to_string(ds_cfg.hnsw_M) +
+        "_efc" + std::to_string(ds_cfg.hnsw_efConstruction) + ".txt";
+    std::string result_dir = "experiments/hnsw/results/" + opts.dataset + "/standard";
+    std::string result_path = result_dir + "/" + result_filename;
 
-    std::ofstream ofs(result_file);
-    if (ofs.is_open()) {
-        ofs << "# Standard HNSW Benchmark (Exact Distances)\n"
-            << "# Dataset: " << dataset_name << "\n"
-            << "# HNSW M: " << hnsw_M << ", efConstruction: " << hnsw_efC << "\n"
-            << "# k: " << k << "\n\n"
-            << std::setw(8) << "ef"
-            << std::setw(15) << "QPS"
-            << std::setw(15) << "Recall"
-            << std::setw(15) << "Latency(ms)" << "\n";
-
-        for (const auto& r : results) {
-            ofs << std::setw(8) << r.ef
-                << std::setw(15) << std::fixed << std::setprecision(0) << r.qps
-                << std::setw(15) << std::setprecision(4) << r.recall
-                << std::setw(15) << std::setprecision(3) << r.latency_ms << "\n";
-        }
-        ofs.close();
-        std::cout << "\nResults saved to: " << result_file << std::endl;
-    }
+    save_results_to_file(
+        result_path, opts.dataset,
+        ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction,
+        nq, k, results);
 
     std::cout << "\nTotal time: " << std::fixed << std::setprecision(1)
-              << global_timer.elapsed_ms() / 1000.0 << " seconds" << std::endl;
+              << global_timer.elapsed_sec() << " seconds" << std::endl;
 
     delete[] xb;
     delete[] xq;
     delete[] gt;
+    delete hnsw_index;
 
     return 0;
 }

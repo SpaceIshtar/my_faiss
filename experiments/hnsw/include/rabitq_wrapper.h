@@ -217,7 +217,7 @@ public:
         code_size_ = bin_data_size_ + ex_data_size_;
 
         // Initialize config for faster quantization
-        config_ = rabitqlib::quant::faster_config(padded_dim_, total_bits);
+        config_ = rabitqlib::quant::faster_config(padded_dim_, rabitqlib::SplitSingleQuery<float>::kNumBits);
 
         // Convert metric type
         metric_type_ = (metric == faiss::METRIC_INNER_PRODUCT)

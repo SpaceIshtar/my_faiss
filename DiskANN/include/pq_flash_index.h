@@ -4,6 +4,8 @@
 #pragma once
 #include "common_includes.h"
 
+#include <functional>
+
 #include "aligned_file_reader.h"
 #include "concurrent_queue.h"
 #include "neighbor.h"
@@ -117,6 +119,13 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     // The caller retains ownership of the faiss_index pointer.
     // Call this after load() and before any search operations.
     DISKANN_DLLEXPORT void set_faiss_index(faiss::IndexFlatCodes *faiss_index);
+
+    // Generic distance computer factory (supports ALL quantizer types,
+    // not just IndexFlatCodes subclasses like OPQ, VAQ, RaBitQ).
+    // The factory is called once per query to create a thread-local DistanceComputer.
+    // Mutually exclusive with set_faiss_index().
+    using DCFactory = std::function<std::unique_ptr<faiss::DistanceComputer>()>;
+    DISKANN_DLLEXPORT void set_distance_computer_factory(DCFactory factory);
 
     // Check if FAISS quantization is being used
     DISKANN_DLLEXPORT bool using_faiss_quantization() const;
@@ -250,6 +259,10 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     // FAISS quantization support (alternative to PQ)
     faiss::IndexFlatCodes *_faiss_index = nullptr;  // externally owned, not managed by this class
     bool _use_faiss_quantization = false;
+
+    // Generic distance computer factory (supports any DistanceComputer)
+    DCFactory _dc_factory;
+    bool _use_dc_factory = false;
 
 #ifdef EXEC_ENV_OLS
     // Set to a larger value than the actual header to accommodate

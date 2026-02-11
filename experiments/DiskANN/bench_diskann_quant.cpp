@@ -6,132 +6,94 @@
  */
 
 /**
- * HNSW + Quantization Benchmark Framework
+ * DiskANN + Quantization Benchmark Framework
  *
- * This benchmark tests HNSW graph traversal with various quantization methods
- * for distance estimation, followed by exact distance reranking.
+ * This benchmark tests DiskANN graph traversal with various quantization methods
+ * for distance estimation via a generic DistanceComputer factory.
  *
  * Usage:
- *   ./bench_hnsw_quant --dataset <name> --algorithm <name> [options]
+ *   ./bench_diskann_quant --dataset <name> --algorithm <name> [options]
  *
  * Options:
- *   --dataset <name>       Dataset name (e.g., sift1m)
- *   --algorithm <name>     Algorithm name (pq, sq)
- *   --config-dir <path>    Config directory (default: ./config)
- *   --data-path <path>     Override dataset base path
- *   --threads <n>          Number of threads
- *   --ef <list>            Comma-separated ef values to test
- *   --timeout <seconds>    Train+add timeout per param set (default: 3600)
- *   --help                 Show this help
+ *   --dataset <name>           Dataset name (e.g., sift1M)
+ *   --algorithm <name>         Algorithm name (pq, sq, opq, rq, lsq, prq, plsq, vaq, rabitq)
+ *   --config-dir <path>        Config directory (default: ./config)
+ *   --algo-config-dir <path>   Algorithm config directory (default: config-dir)
+ *   --data-path <path>         Override dataset base path
+ *   --threads <n>              Number of threads
+ *   --L <list>                 Comma-separated L values to test
+ *   --beam-width <n>           Override beam width
+ *   --help                     Show this help
  *
  * Example:
- *   ./bench_hnsw_quant --dataset sift1m --algorithm pq
- *   ./bench_hnsw_quant --dataset sift1m --algorithm sq --data-path /path/to/data
+ *   ./bench_diskann_quant --dataset sift1M --algorithm pq
+ *   ./bench_diskann_quant --dataset sift1M --algorithm sq --data-path /path/to/data
  */
 
 #include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <omp.h>
 
+// FAISS headers
 #include <faiss/IndexFlat.h>
-#include <faiss/IndexHNSW.h>
-#include <faiss/impl/AuxIndexStructures.h>
-#include <faiss/impl/HNSW.h>
-#include <faiss/impl/ResultHandler.h>
+#include <faiss/impl/DistanceComputer.h>
 
-#include "include/aq_wrapper.h"
-#include "include/bench_config.h"
-#include "include/bench_utils.h"
-#include "include/opq_wrapper.h"
-#include "include/pq_wrapper.h"
-#include "include/quant_wrapper.h"
-#include "include/rabitq_wrapper.h"
-#include "include/sq_wrapper.h"
-#include "include/vaq_wrapper.h"
+// DiskANN headers
+#include "linux_aligned_file_reader.h"
+#include "percentile_stats.h"
+#include "pq_flash_index.h"
+#include "utils.h"
+
+// Shared quantization wrappers (from HNSW framework)
+#include "../hnsw/include/aq_wrapper.h"
+#include "../hnsw/include/opq_wrapper.h"
+#include "../hnsw/include/pq_wrapper.h"
+#include "../hnsw/include/quant_wrapper.h"
+#include "../hnsw/include/rabitq_wrapper.h"
+#include "../hnsw/include/sq_wrapper.h"
+#include "../hnsw/include/vaq_wrapper.h"
+
+// Shared utilities (Timer, fvecs_read, etc.)
+#include "../hnsw/include/bench_utils.h"
+
+// DiskANN-specific config
+#include "include/diskann_bench_config.h"
 
 using namespace hnsw_bench;
+using namespace diskann_bench;
 
 /*****************************************************
- * HNSW search with quantization + rerank
+ * Recall computation (DiskANN returns uint64_t IDs)
  *****************************************************/
 
-QueryStats hnsw_search_with_rerank(
-        const faiss::IndexHNSW* hnsw_index,
-        faiss::DistanceComputer* quant_dc,
-        faiss::DistanceComputer* exact_dc,
-        const float* query,
+float compute_recall_at_k_u64(
+        size_t nq,
         size_t k,
-        size_t ef,
-        float* distances,
-        faiss::idx_t* labels) {
-
-    const faiss::HNSW& hnsw = hnsw_index->hnsw;
-
-    // Set query for both distance computers
-    quant_dc->set_query(query);
-    exact_dc->set_query(query);
-
-    // Prepare heap for ef candidates
-    using RH = faiss::HeapBlockResultHandler<faiss::HNSW::C>;
-    std::vector<float> ef_distances(ef, std::numeric_limits<float>::max());
-    std::vector<faiss::idx_t> ef_labels(ef, -1);
-
-    // Create result handler
-    RH bres(1, ef_distances.data(), ef_labels.data(), ef);
-    RH::SingleResultHandler res(bres);
-
-    // VisitedTable for search
-    faiss::VisitedTable vt(hnsw_index->ntotal);
-
-    // Search parameters
-    faiss::SearchParametersHNSW params;
-    params.efSearch = ef;
-
-    // HNSW search using quantized distances (returns HNSWStats)
-    res.begin(0);
-    faiss::HNSWStats stats = hnsw.search(*quant_dc, hnsw_index, res, vt, &params);
-    res.end();
-
-    // Rerank using exact distances
-    std::vector<std::pair<float, faiss::idx_t>> reranked;
-    reranked.reserve(ef);
-    for (size_t i = 0; i < ef; i++) {
-        if (ef_labels[i] >= 0) {
-            float dist = (*exact_dc)(ef_labels[i]);
-            reranked.push_back({dist, ef_labels[i]});
+        const uint64_t* I,
+        const int* gt,
+        size_t gt_k) {
+    int64_t total_hits = 0;
+    for (size_t i = 0; i < nq; i++) {
+        for (size_t j = 0; j < k; j++) {
+            uint64_t result_id = I[i * k + j];
+            for (size_t l = 0; l < k && l < gt_k; l++) {
+                if (result_id == (uint64_t)gt[i * gt_k + l]) {
+                    total_hits++;
+                    break;
+                }
+            }
         }
     }
-
-    // Sort by exact distance
-    std::sort(reranked.begin(), reranked.end());
-
-    // Return top-k
-    for (size_t i = 0; i < k; i++) {
-        if (i < reranked.size()) {
-            distances[i] = reranked[i].first;
-            labels[i] = reranked[i].second;
-        } else {
-            distances[i] = std::numeric_limits<float>::max();
-            labels[i] = -1;
-        }
-    }
-
-    // Return query stats
-    QueryStats qs;
-    qs.ndis = stats.ndis;
-    qs.nhops = stats.nhops;
-    return qs;
+    return total_hits / float(nq * k);
 }
 
 /*****************************************************
@@ -139,7 +101,7 @@ QueryStats hnsw_search_with_rerank(
  *****************************************************/
 
 struct BenchmarkResult {
-    size_t ef;
+    uint32_t L;
     double qps;
     float recall;
     double latency_ms;
@@ -148,74 +110,77 @@ struct BenchmarkResult {
 };
 
 std::vector<BenchmarkResult> run_benchmark(
-        const faiss::IndexHNSW* hnsw_index,
-        const faiss::IndexFlat* flat_index,
-        QuantWrapper* quant,
+        diskann::PQFlashIndex<float>* flash_index,
         const float* xq,
         size_t nq,
         size_t d,
         const int* gt,
         size_t gt_k,
         size_t k,
-        const std::vector<size_t>& ef_values,
+        const std::vector<uint32_t>& L_values,
+        uint32_t beam_width,
         int num_threads,
         bool verbose = true) {
 
     std::vector<BenchmarkResult> results;
     Timer timer;
 
-    for (size_t ef : ef_values) {
-        std::vector<faiss::idx_t> result_ids(nq * k, -1);
-        std::vector<float> result_dists(nq * k, std::numeric_limits<float>::max());
-        std::vector<QueryStats> query_stats(nq);
+    for (uint32_t L : L_values) {
+        if (L < k) continue;
+
+        std::vector<uint64_t> result_ids(nq * k);
+        std::vector<float> result_dists(nq * k);
+        std::vector<diskann::QueryStats> query_stats(nq);
 
         // Warmup
-        size_t warmup_n = std::min((size_t)10, nq);
+        size_t warmup_n = std::min((size_t)100, nq);
         for (size_t i = 0; i < warmup_n; i++) {
-            auto quant_dc = quant->get_distance_computer();
-            auto exact_dc = std::unique_ptr<faiss::DistanceComputer>(
-                flat_index->get_distance_computer());
-            hnsw_search_with_rerank(
-                hnsw_index, quant_dc.get(), exact_dc.get(),
-                xq + i * d, k, ef,
+            flash_index->cached_beam_search(
+                xq + i * d, k, L,
+                result_ids.data() + i * k,
                 result_dists.data() + i * k,
-                result_ids.data() + i * k);
+                beam_width, false, nullptr);
         }
 
-        // Timed search with stats collection
+        // Reset stats
+        std::memset(query_stats.data(), 0, nq * sizeof(diskann::QueryStats));
+
+        // Timed search
         timer.reset();
 
-        #pragma omp parallel num_threads(num_threads)
-        {
-            auto quant_dc = quant->get_distance_computer();
-            auto exact_dc = std::unique_ptr<faiss::DistanceComputer>(
-                flat_index->get_distance_computer());
-
-            #pragma omp for schedule(dynamic, 1)
-            for (int64_t i = 0; i < (int64_t)nq; i++) {
-                query_stats[i] = hnsw_search_with_rerank(
-                    hnsw_index, quant_dc.get(), exact_dc.get(),
-                    xq + i * d, k, ef,
-                    result_dists.data() + i * k,
-                    result_ids.data() + i * k);
-            }
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(num_threads)
+        for (int64_t i = 0; i < (int64_t)nq; i++) {
+            flash_index->cached_beam_search(
+                xq + i * d, k, L,
+                result_ids.data() + i * k,
+                result_dists.data() + i * k,
+                beam_width, false, &query_stats[i]);
         }
 
         double search_time = timer.elapsed_ms();
         double qps = nq * 1000.0 / search_time;
         double latency = search_time / nq;
-        float recall = compute_recall_at_k(nq, k, result_ids.data(), gt, gt_k);
-        SearchStats stats = SearchStats::compute(query_stats);
+        float recall = compute_recall_at_k_u64(nq, k, result_ids.data(), gt, gt_k);
 
-        results.push_back({ef, qps, recall, latency, search_time, stats});
+        // Aggregate ndis/nhop statistics
+        std::vector<size_t> ndis_values(nq), nhop_values(nq);
+        for (size_t i = 0; i < nq; i++) {
+            ndis_values[i] = query_stats[i].n_cmps;
+            nhop_values[i] = query_stats[i].n_hops;
+        }
+        SearchStats ss;
+        ss.ndis_stats = compute_percentile_stats(ndis_values);
+        ss.nhops_stats = compute_percentile_stats(nhop_values);
+
+        results.push_back({L, qps, recall, latency, search_time, ss});
 
         if (verbose) {
-            std::cout << std::setw(8) << ef
+            std::cout << std::setw(8) << L
                       << std::setw(12) << std::fixed << std::setprecision(0) << qps
                       << std::setw(12) << std::setprecision(4) << recall
                       << std::setw(12) << std::setprecision(3) << latency
-                      << std::setw(12) << std::setprecision(1) << stats.ndis_stats.mean
-                      << std::setw(12) << std::setprecision(1) << stats.nhops_stats.mean
+                      << std::setw(12) << std::setprecision(1) << ss.ndis_stats.mean
+                      << std::setw(12) << std::setprecision(1) << ss.nhops_stats.mean
                       << std::endl;
         }
     }
@@ -246,8 +211,9 @@ void save_results_to_file(
         const std::string& dataset_name,
         const std::string& algorithm_name,
         const std::string& quant_params,
-        int hnsw_M,
-        int hnsw_efConstruction,
+        int diskann_R,
+        int diskann_L_build,
+        uint32_t beam_width,
         size_t nq,
         size_t k,
         const std::vector<BenchmarkResult>& results) {
@@ -266,7 +232,7 @@ void save_results_to_file(
 
     // Header
     ofs << "========================================\n"
-        << "HNSW + Quantization Benchmark Results\n"
+        << "DiskANN + Quantization Benchmark Results\n"
         << "========================================\n\n";
 
     // Configuration
@@ -274,14 +240,15 @@ void save_results_to_file(
         << "  Dataset:           " << dataset_name << "\n"
         << "  Algorithm:         " << algorithm_name << "\n"
         << "  Quant Params:      " << quant_params << "\n"
-        << "  HNSW M:            " << hnsw_M << "\n"
-        << "  HNSW efConstruct:  " << hnsw_efConstruction << "\n"
+        << "  DiskANN R:         " << diskann_R << "\n"
+        << "  DiskANN L_build:   " << diskann_L_build << "\n"
+        << "  Beam Width:        " << beam_width << "\n"
         << "  Num Queries:       " << nq << "\n"
         << "  Recall@k:          " << k << "\n\n";
 
     // Summary table
     ofs << "[Summary]\n"
-        << std::setw(8) << "ef"
+        << std::setw(8) << "L"
         << std::setw(12) << "QPS"
         << std::setw(12) << "Recall"
         << std::setw(12) << "Latency(ms)"
@@ -291,7 +258,7 @@ void save_results_to_file(
         << std::string(68, '-') << "\n";
 
     for (const auto& r : results) {
-        ofs << std::setw(8) << r.ef
+        ofs << std::setw(8) << r.L
             << std::setw(12) << std::fixed << std::setprecision(0) << r.qps
             << std::setw(12) << std::setprecision(4) << r.recall
             << std::setw(12) << std::setprecision(3) << r.latency_ms
@@ -301,18 +268,16 @@ void save_results_to_file(
     }
     ofs << "\n";
 
-    // Detailed statistics for each ef value
+    // Detailed per-L stats
     ofs << "[Detailed Statistics]\n";
     for (const auto& r : results) {
-        ofs << "\n--- ef = " << r.ef << " ---\n"
+        ofs << "\n--- L = " << r.L << " ---\n"
             << "  QPS:          " << std::fixed << std::setprecision(2) << r.qps << "\n"
             << "  Recall@" << k << ":    " << std::setprecision(4) << r.recall << "\n"
             << "  Total Time:   " << std::setprecision(2) << r.total_time_ms << " ms\n"
-            << "  Avg Latency:  " << std::setprecision(4) << r.latency_ms << " ms\n\n";
-
+            << "  Avg Latency:  " << std::setprecision(4) << r.latency_ms << " ms\n";
         print_percentile_stats(ofs, "ndis (distance computations)", r.stats.ndis_stats);
-        ofs << "\n";
-        print_percentile_stats(ofs, "nhops (graph edges traversed)", r.stats.nhops_stats);
+        print_percentile_stats(ofs, "nhops (graph hops)", r.stats.nhops_stats);
     }
 
     ofs << "\n========================================\n"
@@ -326,11 +291,11 @@ void save_results_to_file(
 std::string generate_result_filename(
         const std::string& algorithm,
         const std::string& quant_params,
-        int hnsw_M,
-        int hnsw_efConstruction) {
+        int diskann_R,
+        int diskann_L_build) {
     std::ostringstream oss;
     oss << algorithm << "_" << quant_params
-        << "_M" << hnsw_M << "_efc" << hnsw_efConstruction << ".txt";
+        << "_R" << diskann_R << "_L" << diskann_L_build << ".txt";
     return oss.str();
 }
 
@@ -372,30 +337,32 @@ std::unique_ptr<QuantWrapper> create_wrapper(
  *****************************************************/
 
 struct Options {
-    std::string dataset = "sift1m";
+    std::string dataset = "sift1M";
     std::string algorithm = "sq";
     std::string config_dir = "./config";
-    std::string data_path;  // Override
-    int threads = -1;       // -1 means use config
-    std::vector<size_t> ef_values;  // Empty means use config
-    double timeout_sec = 3600.0;    // Train+add timeout in seconds (default: 1 hour)
+    std::string algo_config_dir;  // defaults to config_dir
+    std::string data_path;        // override
+    int threads = -1;             // -1 = use config
+    std::vector<uint32_t> L_values;
+    uint32_t beam_width = 0;     // 0 = use config
     bool help = false;
 };
 
 void print_usage(const char* prog) {
     std::cout << "Usage: " << prog << " --dataset <name> --algorithm <name> [options]\n\n"
               << "Options:\n"
-              << "  --dataset <name>       Dataset name (e.g., sift1m)\n"
-              << "  --algorithm <name>     Algorithm name (pq, sq)\n"
-              << "  --config-dir <path>    Config directory (default: ./config)\n"
-              << "  --data-path <path>     Override dataset base path\n"
-              << "  --threads <n>          Number of threads\n"
-              << "  --ef <list>            Comma-separated ef values to test\n"
-              << "  --timeout <seconds>    Train+add timeout per param set (default: 3600)\n"
-              << "  --help                 Show this help\n\n"
+              << "  --dataset <name>           Dataset name (e.g., sift1M)\n"
+              << "  --algorithm <name>         Algorithm (pq, opq, sq, rq, lsq, prq, plsq, vaq, rabitq)\n"
+              << "  --config-dir <path>        Config directory (default: ./config)\n"
+              << "  --algo-config-dir <path>   Algorithm config directory (default: config-dir)\n"
+              << "  --data-path <path>         Override dataset base path\n"
+              << "  --threads <n>              Number of threads\n"
+              << "  --L <list>                 Comma-separated L values to test\n"
+              << "  --beam-width <n>           Override beam width\n"
+              << "  --help                     Show this help\n\n"
               << "Example:\n"
-              << "  " << prog << " --dataset sift1m --algorithm pq\n"
-              << "  " << prog << " --dataset sift1m --algorithm sq --data-path /path/to/data\n";
+              << "  " << prog << " --dataset sift1M --algorithm pq\n"
+              << "  " << prog << " --dataset sift1M --algorithm sq --data-path /path/to/data\n";
 }
 
 Options parse_args(int argc, char** argv) {
@@ -411,19 +378,21 @@ Options parse_args(int argc, char** argv) {
             opts.algorithm = argv[++i];
         } else if (arg == "--config-dir" && i + 1 < argc) {
             opts.config_dir = argv[++i];
+        } else if (arg == "--algo-config-dir" && i + 1 < argc) {
+            opts.algo_config_dir = argv[++i];
         } else if (arg == "--data-path" && i + 1 < argc) {
             opts.data_path = argv[++i];
         } else if (arg == "--threads" && i + 1 < argc) {
             opts.threads = std::stoi(argv[++i]);
-        } else if (arg == "--ef" && i + 1 < argc) {
-            std::string ef_str = argv[++i];
-            std::istringstream iss(ef_str);
+        } else if (arg == "--L" && i + 1 < argc) {
+            std::string L_str = argv[++i];
+            std::istringstream iss(L_str);
             std::string token;
             while (std::getline(iss, token, ',')) {
-                opts.ef_values.push_back(std::stoul(token));
+                opts.L_values.push_back(std::stoul(token));
             }
-        } else if (arg == "--timeout" && i + 1 < argc) {
-            opts.timeout_sec = std::stod(argv[++i]);
+        } else if (arg == "--beam-width" && i + 1 < argc) {
+            opts.beam_width = std::stoul(argv[++i]);
         }
     }
 
@@ -443,7 +412,7 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "==================================================" << std::endl;
-    std::cout << "HNSW + Quantization Benchmark Framework" << std::endl;
+    std::cout << "DiskANN + Quantization Benchmark Framework" << std::endl;
     std::cout << "Dataset: " << opts.dataset << std::endl;
     std::cout << "Algorithm: " << opts.algorithm << std::endl;
     std::cout << "==================================================" << std::endl;
@@ -452,9 +421,9 @@ int main(int argc, char** argv) {
 
     // Load dataset config
     std::string datasets_config = opts.config_dir + "/datasets.conf";
-    auto dataset_configs = ConfigParser::parse_datasets(datasets_config);
+    auto dataset_configs = parse_diskann_datasets(datasets_config);
 
-    DatasetConfig ds_cfg;
+    DiskANNDatasetConfig ds_cfg;
     auto it = dataset_configs.find(opts.dataset);
     if (it != dataset_configs.end()) {
         ds_cfg = it->second;
@@ -462,7 +431,7 @@ int main(int argc, char** argv) {
         // Use defaults
         ds_cfg.name = opts.dataset;
         ds_cfg.base_path = "/data/local/embedding_dataset/" + opts.dataset;
-        ds_cfg.ef_search_values = get_default_ef_search();
+        ds_cfg.L_search_values = get_default_L_search();
     }
 
     // Apply command line overrides
@@ -472,11 +441,14 @@ int main(int argc, char** argv) {
     if (opts.threads > 0) {
         ds_cfg.threads = opts.threads;
     }
-    if (!opts.ef_values.empty()) {
-        ds_cfg.ef_search_values = opts.ef_values;
+    if (!opts.L_values.empty()) {
+        ds_cfg.L_search_values = opts.L_values;
     }
-    if (ds_cfg.ef_search_values.empty()) {
-        ds_cfg.ef_search_values = get_default_ef_search();
+    if (opts.beam_width > 0) {
+        ds_cfg.beam_width = opts.beam_width;
+    }
+    if (ds_cfg.L_search_values.empty()) {
+        ds_cfg.L_search_values = get_default_L_search();
     }
 
     omp_set_num_threads(ds_cfg.threads);
@@ -484,7 +456,10 @@ int main(int argc, char** argv) {
     std::cout << "Threads: " << ds_cfg.threads << std::endl;
 
     // Load algorithm config
-    std::string algo_config = opts.config_dir + "/" + opts.algorithm + ".conf";
+    // Try algo-config-dir first, then config-dir
+    std::string algo_config_dir = opts.algo_config_dir.empty()
+        ? opts.config_dir : opts.algo_config_dir;
+    std::string algo_config = algo_config_dir + "/" + opts.algorithm + ".conf";
     auto algo_params = ConfigParser::parse_algorithm(algo_config);
 
     std::vector<AlgorithmParamSet> param_sets;
@@ -493,7 +468,7 @@ int main(int argc, char** argv) {
         param_sets = ait->second;
     }
 
-    // If no config, use defaults
+    // If no config, use defaults (same as HNSW framework)
     if (param_sets.empty()) {
         if (opts.algorithm == "pq") {
             param_sets.push_back({.params = {{"M", "8"}, {"nbits", "8"}}});
@@ -543,26 +518,28 @@ int main(int argc, char** argv) {
     std::cout << "Database: " << nb << " vectors, dimension " << d << std::endl;
     std::cout << "Queries: " << nq << " vectors" << std::endl;
 
-    // Load or build HNSW index
-    std::string hnsw_path = ds_cfg.get_hnsw_index_path();
-    faiss::IndexHNSW* hnsw_index = load_or_build_hnsw(
-        hnsw_path, d, ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction, nb, xb);
+    // Load DiskANN disk index
+    std::string index_prefix = ds_cfg.get_diskann_index_prefix();
+    std::cout << "\n[Loading DiskANN disk index...]" << std::endl;
+    std::cout << "Index prefix: " << index_prefix << std::endl;
 
-    if (!hnsw_index) {
-        std::cerr << "Error: Failed to load/build HNSW index" << std::endl;
-        return 1;
+    std::shared_ptr<AlignedFileReader> reader(new LinuxAlignedFileReader());
+    std::unique_ptr<diskann::PQFlashIndex<float>> flash_index(
+        new diskann::PQFlashIndex<float>(reader, diskann::Metric::L2));
+
+    Timer timer;
+    int load_result = flash_index->load(ds_cfg.threads, index_prefix.c_str());
+    if (load_result != 0) {
+        std::cerr << "Error loading DiskANN index: " << load_result << std::endl;
+        return load_result;
     }
+    std::cout << "DiskANN index load time: " << timer.elapsed_ms() << " ms" << std::endl;
 
-    // Get flat storage for exact distances
-    faiss::IndexFlat* flat_index = dynamic_cast<faiss::IndexFlat*>(hnsw_index->storage);
-    if (!flat_index) {
-        std::cerr << "Error: HNSW storage is not IndexFlat" << std::endl;
-        return 1;
-    }
-
-    // Keep references to abandoned quantizers (from timed-out train+add)
-    // so detached threads can finish safely
-    std::vector<std::shared_ptr<QuantWrapper>> abandoned_quants;
+    // Cache BFS levels for faster search
+    std::vector<uint32_t> node_list;
+    flash_index->cache_bfs_levels(ds_cfg.num_nodes_to_cache, node_list);
+    flash_index->load_cache_list(node_list);
+    std::cout << "Cached " << ds_cfg.num_nodes_to_cache << " nodes" << std::endl;
 
     // Run benchmarks for each parameter set
     for (const auto& ps : param_sets) {
@@ -570,51 +547,23 @@ int main(int argc, char** argv) {
         std::cout << "Algorithm: " << opts.algorithm << " | Params: " << ps.to_string() << std::endl;
         std::cout << "==================================================" << std::endl;
 
-        // Create quantizer wrapper (shared_ptr for safe handoff to thread)
-        auto quant = std::shared_ptr<QuantWrapper>(
-            create_wrapper(opts.algorithm, d, faiss::METRIC_L2, ps.params).release());
+        // Create quantizer wrapper
+        auto quant = create_wrapper(opts.algorithm, d, faiss::METRIC_L2, ps.params);
 
-        // Train and add vectors with timeout
+        // Train and add vectors
         std::cout << "[Training " << quant->get_name() << "...]" << std::endl;
-        std::cout << "  Timeout: " << std::fixed << std::setprecision(0)
-                  << opts.timeout_sec << "s" << std::endl;
+        timer.reset();
+        quant->train(nb, xb);
+        quant->add(nb, xb);
+        std::cout << "Train+add time: " << timer.elapsed_ms() << " ms" << std::endl;
 
-        std::atomic<bool> train_done{false};
-        auto quant_ref = quant;  // shared copy for thread
-        int num_threads = ds_cfg.threads;
-
-        std::thread train_thread([quant_ref, nb, xb, num_threads, &train_done]() {
-            omp_set_num_threads(num_threads);
-            quant_ref->train(nb, xb);
-            quant_ref->add(nb, xb);
-            train_done.store(true, std::memory_order_release);
+        // Set the distance computer factory on the DiskANN index
+        flash_index->set_distance_computer_factory([&quant]() {
+            return quant->get_distance_computer();
         });
 
-        Timer timer;
-        
-        while (!train_done.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            if (timer.elapsed_sec() >= opts.timeout_sec) break;
-        }
-
-        if (!train_done.load(std::memory_order_acquire)) {
-            std::cout << "WARNING: Train+add exceeded timeout ("
-                      << std::fixed << std::setprecision(0)
-                      << timer.elapsed_sec() << "s / "
-                      << opts.timeout_sec << "s limit). "
-                      << "Skipping parameter set: " << ps.to_string()
-                      << std::endl;
-            train_thread.detach();
-            abandoned_quants.push_back(std::move(quant));
-            continue;
-        }
-
-        train_thread.join();
-        std::cout << "Train+add time: " << std::fixed << std::setprecision(0)
-                  << timer.elapsed_ms() << " ms" << std::endl;
-
         // Print results header
-        std::cout << "\n" << std::setw(8) << "ef"
+        std::cout << "\n" << std::setw(8) << "L"
                   << std::setw(12) << "QPS"
                   << std::setw(12) << "Recall@" << ds_cfg.k
                   << std::setw(12) << "Latency(ms)"
@@ -623,22 +572,20 @@ int main(int argc, char** argv) {
         std::cout << std::string(68, '-') << std::endl;
 
         // Run benchmark
-        QuantWrapper* quant_ptr = quant.get();
         auto results = run_benchmark(
-            hnsw_index, flat_index, quant_ptr,
-            xq, nq, d, gt, gt_k, ds_cfg.k,
-            ds_cfg.ef_search_values, ds_cfg.threads);
+            flash_index.get(), xq, nq, d, gt, gt_k, ds_cfg.k,
+            ds_cfg.L_search_values, ds_cfg.beam_width, ds_cfg.threads);
 
         // Save results to file
-        std::string quant_params = quant_ptr->get_params_string();
+        std::string quant_params = quant->get_params_string();
         std::string result_filename = generate_result_filename(
-            opts.algorithm, quant_params, ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction);
-        std::string result_dir = "experiments/hnsw/results/" + opts.dataset + "/" + opts.algorithm;
+            opts.algorithm, quant_params, ds_cfg.diskann_R, ds_cfg.diskann_L_build);
+        std::string result_dir = "experiments/DiskANN/results/" + opts.dataset + "/" + opts.algorithm;
         std::string result_path = result_dir + "/" + result_filename;
 
         save_results_to_file(
             result_path, opts.dataset, opts.algorithm, quant_params,
-            ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction,
+            ds_cfg.diskann_R, ds_cfg.diskann_L_build, ds_cfg.beam_width,
             nq, ds_cfg.k, results);
     }
 
@@ -649,7 +596,6 @@ int main(int argc, char** argv) {
     delete[] xb;
     delete[] xq;
     delete[] gt;
-    delete hnsw_index;
 
     return 0;
 }

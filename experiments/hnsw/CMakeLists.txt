@@ -36,6 +36,7 @@ set(VAQ_EIGEN_DIR ${VAQ_DIR}/external/eigen)
 
 # Build HNSW index
 add_executable(build_hnsw_index EXCLUDE_FROM_ALL build_hnsw_index.cpp)
+target_include_directories(build_hnsw_index PRIVATE ${HNSW_INCLUDE_DIR})
 target_link_libraries(build_hnsw_index PRIVATE faiss OpenMP::OpenMP_CXX)
 
 # Benchmark HNSW with quantization + rerank (old version, kept for reference)
@@ -44,6 +45,7 @@ target_link_libraries(bench_hnsw_quant_rerank PRIVATE faiss OpenMP::OpenMP_CXX)
 
 # Benchmark standard HNSW (exact distances)
 add_executable(bench_hnsw_standard EXCLUDE_FROM_ALL bench_hnsw_standard.cpp)
+target_include_directories(bench_hnsw_standard PRIVATE ${HNSW_INCLUDE_DIR})
 target_link_libraries(bench_hnsw_standard PRIVATE faiss OpenMP::OpenMP_CXX)
 
 # ============================================================
