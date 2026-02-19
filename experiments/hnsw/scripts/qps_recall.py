@@ -8,8 +8,8 @@ matplotlib.rcParams.update({
     "axes.labelsize": 16,
     "axes.titlesize": 18,
     "legend.fontsize": 12,
-    "xtick.labelsize": 12,
-    "ytick.labelsize": 12,
+    "xtick.labelsize": 14,
+    "ytick.labelsize": 14,
 })
 
 # ── Configuration ──────────────────────────────────────────────
@@ -21,20 +21,20 @@ ALGORITHMS = {
     "RaBitQ": "rabitq",
     "RaBitQ-Native": "rabitq_native",
     "OPQ": "opq",
-    "VAQ": "vaq",
+    "VAQ": "vaq", 
     "RQ": "rq",
     "PQR": "prq",
     "LSQ": "lsq",
     "PLSQ": "plsq",
 }
-TARGET_RECALL = 0.95
-NAME = "gist1M_qps_recall_0.95.pdf"
+TARGET_RECALL = 0.90
+NAME = "gist1M_qps_recall_0.90.pdf"
 
 # ── Paths ──────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(SCRIPT_DIR, "..", "results")
-FIGURES_DIR = os.path.join("/common/home/jl3288/overleaf/quantization_benchmark", "figures", DATASET)
-LEGENDS_DIR = os.path.join("/common/home/jl3288/overleaf/quantization_benchmark", "figures", "legends")
+FIGURES_DIR = os.path.join("/common/home/jl3288/overleaf/quantization_benchmark", "figures", "hnsw", DATASET)
+LEGENDS_DIR = os.path.join("/common/home/jl3288/overleaf/quantization_benchmark", "figures", "hnsw","legends")
 
 os.makedirs(FIGURES_DIR, exist_ok=True)
 os.makedirs(LEGENDS_DIR, exist_ok=True)
@@ -92,6 +92,7 @@ for algo_name, algo_folder in ALGORITHMS.items():
 ax.set_xlabel("Recall@10")
 ax.set_ylabel("QPS")
 ax.set_yscale("log")
+# ax.set_xlim(0.8, 1.0)
 ax.grid(True, which="both", linestyle="--", alpha=0.5)
 # ax.set_title(f"{DATASET} — QPS vs Recall")
 

@@ -152,6 +152,7 @@ int main(int argc, char** argv) {
 
     // Build HNSW index
     std::cout << "\n[Building HNSW index...]" << std::endl;
+    omp_set_num_threads(ds_cfg.threads);
     Timer timer;
 
     faiss::IndexHNSWFlat index(d, ds_cfg.hnsw_M, faiss::METRIC_L2);

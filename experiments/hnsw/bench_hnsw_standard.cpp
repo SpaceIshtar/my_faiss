@@ -316,8 +316,8 @@ int main(int argc, char** argv) {
         params.efSearch = ef;
 
         // Warmup
-        hnsw_index->search(std::min((faiss::idx_t)100, (faiss::idx_t)nq),
-                          xq, k, result_dists.data(), result_ids.data(), &params);
+        // hnsw_index->search(std::min((faiss::idx_t)100, (faiss::idx_t)nq),
+        //                   xq, k, result_dists.data(), result_ids.data(), &params);
 
         // Timed search with stats collection
         faiss::hnsw_stats.reset();

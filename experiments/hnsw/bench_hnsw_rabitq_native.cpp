@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -73,7 +74,9 @@ public:
           num_clusters_(num_clusters), ntotal_(0), is_trained_(false) {
 
         // Create rotator
+        // IMPORTANT: Set deterministic seed so rotator is reproducible across save/load
         padded_dim_ = rabitqlib::round_up_to_multiple(d_, 64);
+        std::srand(d_ + padded_dim_);  // Deterministic seed based on dimensions
         rotator_.reset(rabitqlib::choose_rotator<float>(
             d_, rabitqlib::RotatorType::FhtKacRotator, padded_dim_));
 
@@ -160,6 +163,7 @@ public:
     }
 
     // Accessors
+    size_t get_ntotal() const { return ntotal_; }
     size_t padded_dim() const { return padded_dim_; }
     size_t ex_bits() const { return ex_bits_; }
     size_t code_size() const { return code_size_; }
@@ -171,6 +175,116 @@ public:
     rabitqlib::Rotator<float>* rotator() const { return rotator_.get(); }
     const rabitqlib::quant::RabitqConfig& config() const { return config_; }
     IpFunc ip_func() const { return ip_func_; }
+
+    /*****************************************************
+     * Save / Load (same binary format as RaBitQWrapper)
+     *****************************************************/
+
+    bool save(const std::string& path) const {
+        std::ofstream ofs(path, std::ios::binary);
+        if (!ofs.is_open()) return false;
+
+        uint64_t magic = 0x524142495451ULL;
+        uint64_t version = 1;
+        ofs.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+        ofs.write(reinterpret_cast<const char*>(&version), sizeof(version));
+
+        auto write_u64 = [&](uint64_t v) {
+            ofs.write(reinterpret_cast<const char*>(&v), sizeof(v));
+        };
+        write_u64(d_);
+        write_u64(padded_dim_);
+        write_u64(total_bits_);
+        write_u64(ex_bits_);
+        write_u64(num_clusters_);
+        write_u64(ntotal_);
+        write_u64(bin_data_size_);
+        write_u64(ex_data_size_);
+        write_u64(code_size_);
+
+        ofs.write(codes_.data(), ntotal_ * code_size_);
+        ofs.write(reinterpret_cast<const char*>(cluster_ids_.data()),
+                  ntotal_ * sizeof(uint32_t));
+        ofs.write(reinterpret_cast<const char*>(centroids_.data()),
+                  num_clusters_ * d_ * sizeof(float));
+        ofs.write(reinterpret_cast<const char*>(rotated_centroids_.data()),
+                  num_clusters_ * padded_dim_ * sizeof(float));
+
+        ofs.close();
+        return ofs.good();
+    }
+
+    bool load(const std::string& path) {
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs.is_open()) return false;
+
+        uint64_t magic, version;
+        ifs.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+        ifs.read(reinterpret_cast<char*>(&version), sizeof(version));
+        if (magic != 0x524142495451ULL || version != 1) return false;
+
+        auto read_u64 = [&]() -> uint64_t {
+            uint64_t v;
+            ifs.read(reinterpret_cast<char*>(&v), sizeof(v));
+            return v;
+        };
+
+        uint64_t d = read_u64();
+        uint64_t padded_dim = read_u64();
+        uint64_t total_bits = read_u64();
+        uint64_t ex_bits = read_u64();
+        uint64_t num_clusters = read_u64();
+        uint64_t ntotal = read_u64();
+        uint64_t bin_data_size = read_u64();
+        uint64_t ex_data_size = read_u64();
+        uint64_t code_size = read_u64();
+
+        if (d != d_ || padded_dim != padded_dim_ ||
+            total_bits != total_bits_ || ex_bits != ex_bits_ ||
+            num_clusters != num_clusters_ ||
+            bin_data_size != bin_data_size_ ||
+            ex_data_size != ex_data_size_ ||
+            code_size != code_size_) {
+            std::cerr << "Error: RaBitQ index parameters mismatch" << std::endl;
+            return false;
+        }
+
+        ntotal_ = ntotal;
+        is_trained_ = true;
+
+        codes_.resize(ntotal_ * code_size_);
+        ifs.read(codes_.data(), ntotal_ * code_size_);
+
+        cluster_ids_.resize(ntotal_);
+        ifs.read(reinterpret_cast<char*>(cluster_ids_.data()),
+                 ntotal_ * sizeof(uint32_t));
+
+        centroids_.resize(num_clusters_ * d_);
+        ifs.read(reinterpret_cast<char*>(centroids_.data()),
+                 num_clusters_ * d_ * sizeof(float));
+
+        rotated_centroids_.resize(num_clusters_ * padded_dim_);
+        ifs.read(reinterpret_cast<char*>(rotated_centroids_.data()),
+                 num_clusters_ * padded_dim_ * sizeof(float));
+
+        quantizer_.reset(new faiss::IndexFlatL2(d_));
+        quantizer_->add(num_clusters_, centroids_.data());
+
+        if (!ifs.good()) {
+            std::cerr << "Error: failed reading RaBitQ index" << std::endl;
+            return false;
+        }
+        return true;
+    }
+
+    static std::string get_index_path(
+            const std::string& base_path,
+            size_t total_bits,
+            size_t num_clusters) {
+        return base_path + "/index/rabitq_bits" +
+               std::to_string(total_bits) + "_c" +
+               std::to_string(num_clusters) + ".bin";
+    }
 
 private:
     size_t d_;
@@ -223,6 +337,7 @@ using MaxHeap = std::priority_queue<SearchResult>;
 QueryStats1 rabitq_native_search(
         const faiss::HNSW& hnsw,
         const faiss::IndexHNSW* hnsw_index,
+        faiss::VisitedTable& vt,
         const RaBitQIndex* rabitq,
         const float* query,
         size_t k,
@@ -257,9 +372,6 @@ QueryStats1 rabitq_native_search(
     rabitqlib::SplitSingleQuery<float> query_wrapper(
         rotated_query.data(), padded_dim, ex_bits,
         rabitq->config(), rabitqlib::METRIC_L2);
-
-    // Visited table
-    faiss::VisitedTable vt(hnsw_index->ntotal);
 
     // Entry point
     faiss::HNSW::storage_idx_t ep = hnsw.entry_point;
@@ -404,6 +516,8 @@ QueryStats1 rabitq_native_search(
         }
     }
 
+    vt.advance();
+
     // Collect results
     std::vector<SearchResult> results;
     while (!topk_heap.empty()) {
@@ -514,11 +628,12 @@ std::vector<BenchmarkResult> run_benchmark(
             if (do_rerank) {
                 exact_dc.reset(flat_index->get_distance_computer());
             }
+            faiss::VisitedTable vt(hnsw_index->ntotal);
 
             #pragma omp for schedule(dynamic, 1)
             for (int64_t i = 0; i < (int64_t)nq; i++) {
                 query_stats[i] = rabitq_native_search(
-                    hnsw, hnsw_index, rabitq,
+                    hnsw, hnsw_index, vt, rabitq,
                     xq + i * d, k, ef,
                     result_dists.data() + i * k,
                     result_ids.data() + i * k,
@@ -827,12 +942,30 @@ int main(int argc, char** argv) {
             std::cerr << "clusters needed to be set in conf" << std::endl;
             exit(-1);
         }
-        // Build RaBitQ index
-        std::cout << "\n[Building RaBitQ index (bits=" << total_bits << ", ncluster=" << num_clusters << ")...]" << std::endl;
-        Timer timer;
+        // Build or load RaBitQ index
         RaBitQIndex rabitq(d, total_bits, num_clusters);
-        rabitq.add(nb, xb);
-        std::cout << "RaBitQ build time: " << timer.elapsed_ms() << " ms" << std::endl;
+        std::string rabitq_path = RaBitQIndex::get_index_path(
+            ds_cfg.base_path, total_bits, num_clusters);
+
+        if (rabitq.load(rabitq_path)) {
+            std::cout << "\n[Loaded RaBitQ index from " << rabitq_path << "]" << std::endl;
+            std::cout << "  ntotal=" << rabitq.get_ntotal() << std::endl;
+        } else {
+            std::cout << "\n[Building RaBitQ index (bits=" << total_bits
+                      << ", ncluster=" << num_clusters << ")...]" << std::endl;
+            Timer timer;
+            rabitq.add(nb, xb);
+            std::cout << "RaBitQ build time: " << timer.elapsed_ms() << " ms" << std::endl;
+
+            // Save for future runs
+            size_t last_slash = rabitq_path.rfind('/');
+            if (last_slash != std::string::npos) {
+                create_directory(rabitq_path.substr(0, last_slash));
+            }
+            if (rabitq.save(rabitq_path)) {
+                std::cout << "Saved RaBitQ index to: " << rabitq_path << std::endl;
+            }
+        }
 
         // Run benchmark
         std::cout << "\n" << std::setw(8) << "ef"

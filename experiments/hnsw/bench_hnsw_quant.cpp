@@ -45,7 +45,9 @@
 #include <omp.h>
 
 #include <faiss/IndexFlat.h>
+#include <faiss/IndexFlatCodes.h>
 #include <faiss/IndexHNSW.h>
+#include <faiss/index_io.h>
 #include <faiss/impl/AuxIndexStructures.h>
 #include <faiss/impl/HNSW.h>
 #include <faiss/impl/ResultHandler.h>
@@ -68,6 +70,7 @@ using namespace hnsw_bench;
 
 QueryStats hnsw_search_with_rerank(
         const faiss::IndexHNSW* hnsw_index,
+        faiss::VisitedTable& vt,
         faiss::DistanceComputer* quant_dc,
         faiss::DistanceComputer* exact_dc,
         const float* query,
@@ -92,7 +95,7 @@ QueryStats hnsw_search_with_rerank(
     RH::SingleResultHandler res(bres);
 
     // VisitedTable for search
-    faiss::VisitedTable vt(hnsw_index->ntotal);
+    // faiss::VisitedTable vt(hnsw_index->ntotal);
 
     // Search parameters
     faiss::SearchParametersHNSW params;
@@ -101,6 +104,7 @@ QueryStats hnsw_search_with_rerank(
     // HNSW search using quantized distances (returns HNSWStats)
     res.begin(0);
     faiss::HNSWStats stats = hnsw.search(*quant_dc, hnsw_index, res, vt, &params);
+    vt.advance();
     res.end();
 
     // Rerank using exact distances
@@ -170,17 +174,17 @@ std::vector<BenchmarkResult> run_benchmark(
         std::vector<QueryStats> query_stats(nq);
 
         // Warmup
-        size_t warmup_n = std::min((size_t)10, nq);
-        for (size_t i = 0; i < warmup_n; i++) {
-            auto quant_dc = quant->get_distance_computer();
-            auto exact_dc = std::unique_ptr<faiss::DistanceComputer>(
-                flat_index->get_distance_computer());
-            hnsw_search_with_rerank(
-                hnsw_index, quant_dc.get(), exact_dc.get(),
-                xq + i * d, k, ef,
-                result_dists.data() + i * k,
-                result_ids.data() + i * k);
-        }
+        // size_t warmup_n = std::min((size_t)10, nq);
+        // for (size_t i = 0; i < warmup_n; i++) {
+        //     auto quant_dc = quant->get_distance_computer();
+        //     auto exact_dc = std::unique_ptr<faiss::DistanceComputer>(
+        //         flat_index->get_distance_computer());
+        //     hnsw_search_with_rerank(
+        //         hnsw_index, quant_dc.get(), exact_dc.get(),
+        //         xq + i * d, k, ef,
+        //         result_dists.data() + i * k,
+        //         result_ids.data() + i * k);
+        // }
 
         // Timed search with stats collection
         timer.reset();
@@ -190,11 +194,12 @@ std::vector<BenchmarkResult> run_benchmark(
             auto quant_dc = quant->get_distance_computer();
             auto exact_dc = std::unique_ptr<faiss::DistanceComputer>(
                 flat_index->get_distance_computer());
+            faiss::VisitedTable vt(hnsw_index->ntotal);
 
             #pragma omp for schedule(dynamic, 1)
             for (int64_t i = 0; i < (int64_t)nq; i++) {
                 query_stats[i] = hnsw_search_with_rerank(
-                    hnsw_index, quant_dc.get(), exact_dc.get(),
+                    hnsw_index, vt, quant_dc.get(), exact_dc.get(),
                     xq + i * d, k, ef,
                     result_dists.data() + i * k,
                     result_ids.data() + i * k);
@@ -570,48 +575,66 @@ int main(int argc, char** argv) {
         std::cout << "Algorithm: " << opts.algorithm << " | Params: " << ps.to_string() << std::endl;
         std::cout << "==================================================" << std::endl;
 
-        // Create quantizer wrapper (shared_ptr for safe handoff to thread)
-        auto quant = std::shared_ptr<QuantWrapper>(
+        // Create wrapper and generate save path
+        std::shared_ptr<QuantWrapper> quant(
             create_wrapper(opts.algorithm, d, faiss::METRIC_L2, ps.params).release());
+        std::string quant_params_str = quant->get_params_string();
+        std::string quant_save_path = get_quant_index_path(
+            ds_cfg.base_path, opts.algorithm, quant_params_str);
 
-        // Train and add vectors with timeout
-        std::cout << "[Training " << quant->get_name() << "...]" << std::endl;
-        std::cout << "  Timeout: " << std::fixed << std::setprecision(0)
-                  << opts.timeout_sec << "s" << std::endl;
+        // Try loading from disk
+        if (quant->load(quant_save_path)) {
+            std::cout << "[Loaded " << quant->get_name() << " from " << quant_save_path << "]" << std::endl;
+            std::cout << "  ntotal=" << quant->get_ntotal() << std::endl;
+        } else {
+            // Train and add vectors with timeout
+            std::cout << "[Training " << quant->get_name() << "...]" << std::endl;
+            std::cout << "  Timeout: " << std::fixed << std::setprecision(0)
+                      << opts.timeout_sec << "s" << std::endl;
 
-        std::atomic<bool> train_done{false};
-        auto quant_ref = quant;  // shared copy for thread
-        int num_threads = ds_cfg.threads;
+            std::atomic<bool> train_done{false};
+            auto quant_ref = quant;  // shared copy for thread
+            int num_threads = ds_cfg.threads;
 
-        std::thread train_thread([quant_ref, nb, xb, num_threads, &train_done]() {
-            omp_set_num_threads(num_threads);
-            quant_ref->train(nb, xb);
-            quant_ref->add(nb, xb);
-            train_done.store(true, std::memory_order_release);
-        });
+            std::thread train_thread([quant_ref, nb, xb, num_threads, &train_done]() {
+                omp_set_num_threads(num_threads);
+                quant_ref->train(nb, xb);
+                quant_ref->add(nb, xb);
+                train_done.store(true, std::memory_order_release);
+            });
 
-        Timer timer;
-        
-        while (!train_done.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            if (timer.elapsed_sec() >= opts.timeout_sec) break;
+            Timer timer;
+
+            while (!train_done.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                if (timer.elapsed_sec() >= opts.timeout_sec) break;
+            }
+
+            if (!train_done.load(std::memory_order_acquire)) {
+                std::cout << "WARNING: Train+add exceeded timeout ("
+                          << std::fixed << std::setprecision(0)
+                          << timer.elapsed_sec() << "s / "
+                          << opts.timeout_sec << "s limit). "
+                          << "Skipping parameter set: " << ps.to_string()
+                          << std::endl;
+                train_thread.detach();
+                abandoned_quants.push_back(std::move(quant));
+                continue;
+            }
+
+            train_thread.join();
+            std::cout << "Train+add time: " << std::fixed << std::setprecision(0)
+                      << timer.elapsed_ms() << " ms" << std::endl;
+
+            // Save quantizer to disk
+            size_t last_slash = quant_save_path.rfind('/');
+            if (last_slash != std::string::npos) {
+                create_directory(quant_save_path.substr(0, last_slash));
+            }
+            if (quant->save(quant_save_path)) {
+                std::cout << "Saved quantizer to: " << quant_save_path << std::endl;
+            }
         }
-
-        if (!train_done.load(std::memory_order_acquire)) {
-            std::cout << "WARNING: Train+add exceeded timeout ("
-                      << std::fixed << std::setprecision(0)
-                      << timer.elapsed_sec() << "s / "
-                      << opts.timeout_sec << "s limit). "
-                      << "Skipping parameter set: " << ps.to_string()
-                      << std::endl;
-            train_thread.detach();
-            abandoned_quants.push_back(std::move(quant));
-            continue;
-        }
-
-        train_thread.join();
-        std::cout << "Train+add time: " << std::fixed << std::setprecision(0)
-                  << timer.elapsed_ms() << " ms" << std::endl;
 
         // Print results header
         std::cout << "\n" << std::setw(8) << "ef"
@@ -630,14 +653,13 @@ int main(int argc, char** argv) {
             ds_cfg.ef_search_values, ds_cfg.threads);
 
         // Save results to file
-        std::string quant_params = quant_ptr->get_params_string();
         std::string result_filename = generate_result_filename(
-            opts.algorithm, quant_params, ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction);
+            opts.algorithm, quant_params_str, ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction);
         std::string result_dir = "experiments/hnsw/results/" + opts.dataset + "/" + opts.algorithm;
         std::string result_path = result_dir + "/" + result_filename;
 
         save_results_to_file(
-            result_path, opts.dataset, opts.algorithm, quant_params,
+            result_path, opts.dataset, opts.algorithm, quant_params_str,
             ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction,
             nq, ds_cfg.k, results);
     }

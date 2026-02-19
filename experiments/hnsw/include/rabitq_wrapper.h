@@ -24,6 +24,7 @@
 #include <faiss/MetricType.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <sstream>
@@ -207,7 +208,9 @@ public:
         ex_bits_ = total_bits - 1;  // Extra bits beyond 1-bit
 
         // Create rotator (FHT-based for efficiency)
+        // IMPORTANT: Set deterministic seed so rotator is reproducible across save/load
         padded_dim_ = rabitqlib::round_up_to_multiple(d_, 64);
+        std::srand(d_ + padded_dim_);  // Deterministic seed based on dimensions
         rotator_.reset(rabitqlib::choose_rotator<float>(
             d_, rabitqlib::RotatorType::FhtKacRotator, padded_dim_));
 
@@ -357,6 +360,109 @@ public:
     rabitqlib::Rotator<float>* get_rotator() const { return rotator_.get(); }
     const rabitqlib::quant::RabitqConfig& get_config() const { return config_; }
     rabitqlib::MetricType get_rabitq_metric() const { return metric_type_; }
+
+    /*****************************************************
+     * Custom save / load (RaBitQ is not a faiss::Index)
+     *****************************************************/
+
+    bool save(const std::string& path) override {
+        std::ofstream ofs(path, std::ios::binary);
+        if (!ofs.is_open()) return false;
+
+        uint64_t magic = 0x524142495451ULL;  // "RABITQ"
+        uint64_t version = 1;
+        ofs.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+        ofs.write(reinterpret_cast<const char*>(&version), sizeof(version));
+
+        auto write_u64 = [&](uint64_t v) {
+            ofs.write(reinterpret_cast<const char*>(&v), sizeof(v));
+        };
+        write_u64(d_);
+        write_u64(padded_dim_);
+        write_u64(total_bits_);
+        write_u64(ex_bits_);
+        write_u64(num_clusters_);
+        write_u64(ntotal_);
+        write_u64(bin_data_size_);
+        write_u64(ex_data_size_);
+        write_u64(code_size_);
+
+        ofs.write(codes_.data(), ntotal_ * code_size_);
+        ofs.write(reinterpret_cast<const char*>(cluster_ids_.data()),
+                  ntotal_ * sizeof(uint32_t));
+        ofs.write(reinterpret_cast<const char*>(centroids_.data()),
+                  num_clusters_ * d_ * sizeof(float));
+        ofs.write(reinterpret_cast<const char*>(rotated_centroids_.data()),
+                  num_clusters_ * padded_dim_ * sizeof(float));
+
+        ofs.close();
+        return ofs.good();
+    }
+
+    bool load(const std::string& path) override {
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs.is_open()) return false;
+
+        uint64_t magic, version;
+        ifs.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+        ifs.read(reinterpret_cast<char*>(&version), sizeof(version));
+        if (magic != 0x524142495451ULL || version != 1) return false;
+
+        auto read_u64 = [&]() -> uint64_t {
+            uint64_t v;
+            ifs.read(reinterpret_cast<char*>(&v), sizeof(v));
+            return v;
+        };
+
+        uint64_t d = read_u64();
+        uint64_t padded_dim = read_u64();
+        uint64_t total_bits = read_u64();
+        uint64_t ex_bits = read_u64();
+        uint64_t num_clusters = read_u64();
+        uint64_t ntotal = read_u64();
+        uint64_t bin_data_size = read_u64();
+        uint64_t ex_data_size = read_u64();
+        uint64_t code_size = read_u64();
+
+        // Verify parameters match this wrapper's construction
+        if (d != d_ || padded_dim != padded_dim_ ||
+            total_bits != total_bits_ || ex_bits != ex_bits_ ||
+            num_clusters != num_clusters_ ||
+            bin_data_size != bin_data_size_ ||
+            ex_data_size != ex_data_size_ ||
+            code_size != code_size_) {
+            std::cerr << "Error: RaBitQ index parameters mismatch" << std::endl;
+            return false;
+        }
+
+        ntotal_ = ntotal;
+        is_trained_ = true;
+
+        codes_.resize(ntotal_ * code_size_);
+        ifs.read(codes_.data(), ntotal_ * code_size_);
+
+        cluster_ids_.resize(ntotal_);
+        ifs.read(reinterpret_cast<char*>(cluster_ids_.data()),
+                 ntotal_ * sizeof(uint32_t));
+
+        centroids_.resize(num_clusters_ * d_);
+        ifs.read(reinterpret_cast<char*>(centroids_.data()),
+                 num_clusters_ * d_ * sizeof(float));
+
+        rotated_centroids_.resize(num_clusters_ * padded_dim_);
+        ifs.read(reinterpret_cast<char*>(rotated_centroids_.data()),
+                 num_clusters_ * padded_dim_ * sizeof(float));
+
+        // Reconstruct quantizer from centroids
+        quantizer_.reset(new faiss::IndexFlatL2(d_));
+        quantizer_->add(num_clusters_, centroids_.data());
+
+        if (!ifs.good()) {
+            std::cerr << "Error: failed reading RaBitQ index" << std::endl;
+            return false;
+        }
+        return true;
+    }
 
 private:
     size_t d_;

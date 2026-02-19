@@ -64,6 +64,12 @@ public:
         return index_->ntotal;
     }
 
+    faiss::Index* get_faiss_index() override { return index_.get(); }
+
+    bool load(const std::string& path) override {
+        return load_faiss_index(path, index_);
+    }
+
     // SQ-specific accessors
     faiss::ScalarQuantizer::QuantizerType get_qtype() const { return qtype_; }
     faiss::IndexScalarQuantizer* get_index() { return index_.get(); }

@@ -9,48 +9,79 @@ class ResultEntry:
     qps: float
     recall: float
     latency: float
+    ndis: float | None = None
+    nhops: float | None = None
 
 
 @dataclass
 class ResultFile:
     filepath: str
-    entries: list  # list of ResultEntry
+    entries: list        # list of ResultEntry
+    build_time: float | None = None  # seconds, parsed from [Configuration] if present
+
+
+def _detect_ndis_nhops_columns(header_parts: list) -> tuple:
+    """From the column header tokens, find the indices for ndis and nhops.
+
+    Returns (ndis_idx, nhops_idx) where each may be None.
+
+    Column layouts seen:
+      Standard:       ef  QPS  Recall  Latency(ms)
+      Quant:          ef  QPS  Recall  Latency(ms)  ndis_mean   nhops_mean
+      RaBitQ-Native:  ef  QPS  Recall  Latency(ms)  ndis1_mean  ndis2_mean  nhops_mean
+    """
+    ndis_idx = nhops_idx = None
+    for i, col in enumerate(header_parts):
+        col_l = col.lower()
+        if ndis_idx is None and col_l.startswith("ndis"):
+            ndis_idx = i
+        if col_l.startswith("nhops"):
+            nhops_idx = i
+    return ndis_idx, nhops_idx
 
 
 def parse_result_file(filepath: str) -> ResultFile:
-    """Parse a benchmark result .txt file and extract (ef, QPS, Recall, Latency) rows.
+    """Parse a benchmark result .txt file and extract summary rows.
 
     Supports both the standard format (comment headers) and
     the quantization format ([Summary] section).
+    Extracts ef, QPS, Recall, Latency, and optionally ndis/nhops.
     """
     entries = []
+    build_time = None
     with open(filepath, "r") as f:
         lines = f.readlines()
 
     in_summary = False
-    is_standard = False
+    ndis_idx = nhops_idx = None
 
     for line in lines:
         stripped = line.strip()
 
-        # Detect standard format header line
-        if stripped.startswith("ef") and "QPS" in stripped and "Recall" in stripped:
-            in_summary = True
-            is_standard = True
-            continue
+        # Parse build time from [Configuration] section
+        m = re.match(r"Build Time:\s+([\d.]+)\s*s", stripped)
+        if m:
+            build_time = float(m.group(1))
 
         # Detect quantization format [Summary] marker
         if stripped == "[Summary]":
             in_summary = True
             continue
 
-        # Skip separator / column header lines in quantization format
-        if in_summary and (stripped.startswith("---") or stripped.startswith("ef")):
+        # Detect column header line (works for both standard and quant formats)
+        if stripped.startswith("ef") and "QPS" in stripped and "Recall" in stripped:
+            in_summary = True
+            header_parts = stripped.split()
+            ndis_idx, nhops_idx = _detect_ndis_nhops_columns(header_parts)
+            continue
+
+        # Skip separator lines
+        if in_summary and stripped.startswith("---"):
             continue
 
         # End of summary table: blank line or next section
         if in_summary and (stripped == "" or stripped.startswith("[")):
-            if entries:  # already collected data, stop
+            if entries:
                 break
             continue
 
@@ -61,12 +92,16 @@ def parse_result_file(filepath: str) -> ResultFile:
                     ef = int(parts[0])
                     qps = float(parts[1])
                     recall = float(parts[2])
+                    # if (recall < 0.8):
+                    #     continue
                     latency = float(parts[3])
-                    entries.append(ResultEntry(ef=ef, qps=qps, recall=recall, latency=latency))
+                    ndis = float(parts[ndis_idx]) if ndis_idx is not None and ndis_idx < len(parts) else None
+                    nhops = float(parts[nhops_idx]) if nhops_idx is not None and nhops_idx < len(parts) else None
+                    entries.append(ResultEntry(ef=ef, qps=qps, recall=recall, latency=latency, ndis=ndis, nhops=nhops))
                 except ValueError:
                     continue
 
-    return ResultFile(filepath=filepath, entries=entries)
+    return ResultFile(filepath=filepath, entries=entries, build_time=build_time)
 
 
 def load_all_results(results_dir: str, dataset: str, algo_folder: str) -> list:
@@ -119,3 +154,52 @@ def select_best_config(result_files: list, target_recall: float) -> ResultFile |
                 best_file = rf
 
     return best_file
+
+
+# ── Label generation ──────────────────────────────────────────
+
+_METHOD_NAMES = {
+    "standard": "Standard",
+    "pq": "PQ",
+    "sq": "SQ",
+    "rabitq": "RaBitQ",
+    "rabitq_native": "RaBitQ-Native",
+    "opq": "OPQ",
+    "vaq": "VAQ",
+    "rq": "RQ",
+    "prq": "PQR",
+    "lsq": "LSQ",
+    "plsq": "PLSQ",
+}
+
+
+def make_label(relpath: str) -> str:
+    """Generate a legend label from a relative result path.
+
+    E.g. "pq/pq_M16_nbits8_M32_efc200.txt" -> "PQ (M16, nbits8)"
+         "rabitq_native/rabitq_native_bits1_c128_rerank_M32_efc200.txt"
+           -> "RaBitQ-Native (bits1, c128, rerank)"
+    """
+    folder = relpath.split("/")[0]
+    fname = os.path.splitext(os.path.basename(relpath))[0]
+
+    method = _METHOD_NAMES.get(folder, folder)
+
+    # Strip algo prefix
+    prefix = folder + "_"
+    if fname.startswith(prefix):
+        rest = fname[len(prefix):]
+    else:
+        rest = fname
+
+    # Strip HNSW suffix (_M{d}_efc{d})
+    rest = re.sub(r"_M\d+_efc\d+$", "", rest)
+
+    # Strip "rerank" from rabitq_native params
+    if folder == "rabitq_native":
+        rest = re.sub(r"_?rerank_?", "", rest).strip("_")
+
+    if rest:
+        params = rest.replace("_", ", ")
+        return f"{method} ({params})"
+    return method

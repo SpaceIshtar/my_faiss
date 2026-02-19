@@ -65,6 +65,12 @@ public:
         return index_->ntotal;
     }
 
+    faiss::Index* get_faiss_index() override { return index_.get(); }
+
+    bool load(const std::string& path) override {
+        return load_faiss_index(path, index_);
+    }
+
     // PQ-specific accessors
     size_t get_M() const { return M_; }
     size_t get_nbits() const { return nbits_; }

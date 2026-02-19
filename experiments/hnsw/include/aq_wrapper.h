@@ -62,6 +62,10 @@ public:
 
     size_t get_dimension() const override { return d_; }
     size_t get_ntotal() const override { return index_->ntotal; }
+    faiss::Index* get_faiss_index() override { return index_.get(); }
+    bool load(const std::string& path) override {
+        return load_faiss_index(path, index_);
+    }
 
 private:
     size_t d_;
@@ -116,6 +120,10 @@ public:
 
     size_t get_dimension() const override { return d_; }
     size_t get_ntotal() const override { return index_->ntotal; }
+    faiss::Index* get_faiss_index() override { return index_.get(); }
+    bool load(const std::string& path) override {
+        return load_faiss_index(path, index_);
+    }
 
 private:
     size_t d_;
@@ -171,6 +179,10 @@ public:
 
     size_t get_dimension() const override { return d_; }
     size_t get_ntotal() const override { return index_->ntotal; }
+    faiss::Index* get_faiss_index() override { return index_.get(); }
+    bool load(const std::string& path) override {
+        return load_faiss_index(path, index_);
+    }
 
 private:
     size_t d_;
@@ -227,6 +239,10 @@ public:
 
     size_t get_dimension() const override { return d_; }
     size_t get_ntotal() const override { return index_->ntotal; }
+    faiss::Index* get_faiss_index() override { return index_.get(); }
+    bool load(const std::string& path) override {
+        return load_faiss_index(path, index_);
+    }
 
 private:
     size_t d_;
