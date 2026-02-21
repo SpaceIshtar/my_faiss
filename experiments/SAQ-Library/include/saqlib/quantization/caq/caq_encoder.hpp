@@ -241,7 +241,11 @@ class CAQEncoder {
                 base_code.ip_cent_oa = centroid->dot(caq.get_oa());
             }
             base_code.norm_ip_o_oa = caq.ip_o_oa / caq.o_l2norm / std::sqrt(caq.oa_l2sqr);
+        }
 
+        // Short-code packing is used for 1-bit as well, so code must always be populated
+        // for any quantization with bits > 0.
+        if (num_bits_ > 0) {
             base_code.code = std::move(caq.code);
         }
     }
