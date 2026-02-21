@@ -59,6 +59,7 @@
 #include "include/pq_wrapper.h"
 #include "include/quant_wrapper.h"
 #include "include/rabitq_wrapper.h"
+#include "include/saq_wrapper.h"
 #include "include/sq_wrapper.h"
 #include "include/vaq_wrapper.h"
 
@@ -367,6 +368,8 @@ std::unique_ptr<QuantWrapper> create_wrapper(
         return create_vaq_wrapper(d, metric, params);
     } else if (algorithm == "rabitq") {
         return create_rabitq_wrapper(d, metric, params);
+    } else if (algorithm == "saq") {
+        return create_saq_wrapper(d, metric, params);
     } else {
         throw std::runtime_error("Unknown algorithm: " + algorithm);
     }
@@ -391,7 +394,7 @@ void print_usage(const char* prog) {
     std::cout << "Usage: " << prog << " --dataset <name> --algorithm <name> [options]\n\n"
               << "Options:\n"
               << "  --dataset <name>       Dataset name (e.g., sift1m)\n"
-              << "  --algorithm <name>     Algorithm name (pq, sq)\n"
+              << "  --algorithm <name>     Algorithm name (pq, opq, sq, rq, lsq, prq, plsq, vaq, rabitq, saq)\n"
               << "  --config-dir <path>    Config directory (default: ./config)\n"
               << "  --data-path <path>     Override dataset base path\n"
               << "  --threads <n>          Number of threads\n"
@@ -530,6 +533,10 @@ int main(int argc, char** argv) {
             param_sets.push_back({.params = {{"bits", "1"}}});
             param_sets.push_back({.params = {{"bits", "2"}}});
             param_sets.push_back({.params = {{"bits", "4"}}});
+        } else if (opts.algorithm == "saq") {
+            param_sets.push_back({.params = {{"bits", "1"}, {"clusters", "4096"}}});
+            param_sets.push_back({.params = {{"bits", "2"}, {"clusters", "4096"}}});
+            param_sets.push_back({.params = {{"bits", "4"}, {"clusters", "4096"}}});
         }
     }
 

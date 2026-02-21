@@ -142,6 +142,10 @@ endif()
 # RaBitQ library
 set(RABITQ_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../RaBitQ-Library/include)
 
+# SAQ library
+set(SAQ_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../SAQ-Library/include)
+set(SAQ_CORE_INCLUDE_DIR ${SAQ_INCLUDE_DIR}/saqlib)
+
 # VAQ library
 set(VAQ_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../VAQ)
 set(VAQ_INCLUDE_DIR ${VAQ_DIR}/bitvecengine)
@@ -153,6 +157,8 @@ target_include_directories(bench_diskann_quant PRIVATE
     ${MKL_INCLUDE_DIR}
     ${HNSW_EXP_DIR}
     ${RABITQ_INCLUDE_DIR}
+    ${SAQ_INCLUDE_DIR}
+    ${SAQ_CORE_INCLUDE_DIR}
     ${VAQ_INCLUDE_DIR}
     ${VAQ_EIGEN_DIR}
 )

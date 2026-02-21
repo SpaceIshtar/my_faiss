@@ -13,6 +13,10 @@ set(HNSW_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 # RaBitQ library include directory
 set(RABITQ_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../RaBitQ-Library/include)
 
+# SAQ library include directories
+set(SAQ_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../SAQ-Library/include)
+set(SAQ_CORE_INCLUDE_DIR ${SAQ_INCLUDE_DIR}/saqlib)
+
 # VAQ library directories
 set(VAQ_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../VAQ)
 set(VAQ_INCLUDE_DIR ${VAQ_DIR}/bitvecengine)
@@ -72,6 +76,8 @@ add_executable(bench_hnsw_quant EXCLUDE_FROM_ALL bench_hnsw_quant.cpp)
 target_include_directories(bench_hnsw_quant PRIVATE
     ${HNSW_INCLUDE_DIR}
     ${RABITQ_INCLUDE_DIR}
+    ${SAQ_INCLUDE_DIR}
+    ${SAQ_CORE_INCLUDE_DIR}
     ${VAQ_INCLUDE_DIR}
     ${VAQ_EIGEN_DIR}
 )
