@@ -236,7 +236,7 @@ struct ConstructionStorageIndex : faiss::Index {
                 case ConstructionMode::ADC_SDC: {
                     // Both search and pruning use quantized distances
                     auto* dc = quant_index->get_distance_computer();
-                    // debug_dc(/"ADC_SDC quant_index", quant_index, dc);
+                    // debug_dc("ADC_SDC quant_index", quant_index, dc);
                     return dc;
                 }
 
