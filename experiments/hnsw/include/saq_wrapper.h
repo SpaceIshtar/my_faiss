@@ -58,6 +58,8 @@ class SAQDistanceComputer : public faiss::DistanceComputer {
     saqlib::FloatVec query_;
     std::unique_ptr<saqlib::SaqCluEstimator<saqlib::DistType::L2Sqr>> estimator_;
     uint32_t prepared_cluster_ = std::numeric_limits<uint32_t>::max();
+    uint32_t prepared_block_ = std::numeric_limits<uint32_t>::max();
+    alignas(64) __m512 fast_block_cache_[2];
 };
 
 class SAQWrapper : public QuantWrapper {
@@ -418,6 +420,7 @@ inline void SAQDistanceComputer::set_query(const float* x) {
             searcher_cfg_,
             query_);
     prepared_cluster_ = std::numeric_limits<uint32_t>::max();
+    prepared_block_ = std::numeric_limits<uint32_t>::max();
 }
 
 inline float SAQDistanceComputer::operator()(faiss::idx_t i) {
@@ -427,13 +430,30 @@ inline float SAQDistanceComputer::operator()(faiss::idx_t i) {
 
     const uint32_t cid = parent_->vector_cluster_ids_[i];
     const uint32_t off = parent_->vector_offsets_[i];
+    if (cid >= parent_->clusters_.size()) {
+        return std::numeric_limits<float>::infinity();
+    }
+    if (off >= parent_->clusters_[cid]->num_vec_) {
+        return std::numeric_limits<float>::infinity();
+    }
 
     if (cid != prepared_cluster_) {
         estimator_->prepare(parent_->clusters_[cid].get());
         prepared_cluster_ = cid;
+        prepared_block_ = std::numeric_limits<uint32_t>::max();
     }
 
-    return estimator_->compAccurateDist(off);
+    // Upstream SAQ estimator requires compFastDist(block) before compAccurateDist(vec).
+    const uint32_t block = off / saqlib::KFastScanSize;
+    if (block != prepared_block_) {
+        estimator_->compFastDist(block, fast_block_cache_);
+        prepared_block_ = block;
+    }
+    const float dist = estimator_->compAccurateDist(off);
+    if (!std::isfinite(dist)) {
+        return std::numeric_limits<float>::infinity();
+    }
+    return dist;
 }
 
 inline bool parse_saq_bool(const std::string& v) {
