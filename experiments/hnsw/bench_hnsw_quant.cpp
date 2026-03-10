@@ -56,6 +56,7 @@
 #include "include/bench_config.h"
 #include "include/bench_utils.h"
 #include "include/opq_wrapper.h"
+#include "include/osq_wrapper.h"
 #include "include/pq_wrapper.h"
 #include "include/quant_wrapper.h"
 #include "include/rabitq_wrapper.h"
@@ -370,6 +371,8 @@ std::unique_ptr<QuantWrapper> create_wrapper(
         return create_rabitq_wrapper(d, metric, params);
     } else if (algorithm == "saq") {
         return create_saq_wrapper(d, metric, params);
+    } else if (algorithm == "osq") {
+        return create_osq_wrapper(d, metric, params);
     } else {
         throw std::runtime_error("Unknown algorithm: " + algorithm);
     }
@@ -537,6 +540,10 @@ int main(int argc, char** argv) {
             param_sets.push_back({.params = {{"bits", "1"}, {"clusters", "4096"}}});
             param_sets.push_back({.params = {{"bits", "2"}, {"clusters", "4096"}}});
             param_sets.push_back({.params = {{"bits", "4"}, {"clusters", "4096"}}});
+        } else if (opts.algorithm == "osq") {
+            param_sets.push_back({.params = {{"encoding", "PACKED_NIBBLE"}, {"similarity", "EUCLIDEAN"}}});
+            param_sets.push_back({.params = {{"encoding", "SINGLE_BIT_QUERY_NIBBLE"}, {"similarity", "EUCLIDEAN"}}});
+            param_sets.push_back({.params = {{"encoding", "DIBIT_QUERY_NIBBLE"}, {"similarity", "EUCLIDEAN"}}});
         }
     }
 

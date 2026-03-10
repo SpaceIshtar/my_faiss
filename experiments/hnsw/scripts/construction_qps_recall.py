@@ -15,7 +15,7 @@ matplotlib.rcParams.update({
 
 # ── Configuration ──────────────────────────────────────────────
 DATASET = "gist1M"
-METHOD = "sq"
+METHOD = "pq"
 TARGET_RECALL = 0.90
 TARGET_TIME = 361.467
 MIN_EF = 20  # skip ef values below this threshold in all plots

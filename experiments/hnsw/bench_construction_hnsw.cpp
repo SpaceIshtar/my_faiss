@@ -832,7 +832,7 @@ int main(int argc, char** argv) {
                     [quant_ptr, nb, xb, num_threads, &train_done]() {
                         omp_set_num_threads(num_threads);
                         quant_ptr->train(nb, xb);
-                        // quant_ptr->add(nb, xb);
+                        quant_ptr->add(nb, xb);
                         train_done.store(true, std::memory_order_release);
                     });
 

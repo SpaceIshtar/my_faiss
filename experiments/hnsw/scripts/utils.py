@@ -1,5 +1,6 @@
 import os
 import re
+import csv
 from dataclasses import dataclass
 
 
@@ -120,6 +121,69 @@ def load_all_results(results_dir: str, dataset: str, algo_folder: str) -> list:
             if rf.entries:
                 result_files.append(rf)
     return result_files
+
+
+def load_symphonyqg_result(filepath: str) -> ResultFile | None:
+    """Load SymphonyQG CSV result file with columns: ef_search,qps,recall."""
+    if not os.path.isfile(filepath):
+        return None
+
+    entries = []
+    with open(filepath, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                ef = int(float(row["ef_search"]))
+                qps = float(row["qps"])
+                recall = float(row["recall"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            entries.append(ResultEntry(ef=ef, qps=qps, recall=recall, latency=0.0))
+
+    if not entries:
+        return None
+    return ResultFile(filepath=filepath, entries=entries)
+
+
+def load_hvs_result(filepath: str) -> ResultFile | None:
+    """Load HVS .out result file with table columns: efsearch time_us qps recall."""
+    if not os.path.isfile(filepath):
+        return None
+
+    entries = []
+    with open(filepath, "r") as f:
+        lines = f.readlines()
+
+    in_table = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if stripped.startswith("efsearch") and "qps" in stripped and "recall" in stripped:
+            in_table = True
+            continue
+
+        if not in_table:
+            continue
+
+        parts = stripped.split()
+        if len(parts) < 4:
+            continue
+
+        try:
+            ef = int(parts[0])
+            latency_us = float(parts[1])
+            qps = float(parts[2])
+            recall = float(parts[3])
+        except ValueError:
+            continue
+
+        entries.append(ResultEntry(ef=ef, qps=qps, recall=recall, latency=latency_us / 1000.0))
+
+    if not entries:
+        return None
+    return ResultFile(filepath=filepath, entries=entries)
 
 
 def select_best_config(result_files: list, target_recall: float) -> ResultFile | None:

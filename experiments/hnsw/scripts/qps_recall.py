@@ -1,7 +1,12 @@
 import os
 import matplotlib.pyplot as plt
 import matplotlib
-from utils import load_all_results, select_best_config
+from utils import (
+    load_all_results,
+    select_best_config,
+    load_symphonyqg_result,
+    load_hvs_result,
+)
 
 matplotlib.rcParams.update({
     "font.size": 14,
@@ -13,7 +18,7 @@ matplotlib.rcParams.update({
 })
 
 # ── Configuration ──────────────────────────────────────────────
-DATASET = "gist1M"
+DATASET = "paper"
 ALGORITHMS = {
     "Standard": "standard",
     "PQ": "pq",
@@ -28,13 +33,15 @@ ALGORITHMS = {
     "PLSQ": "plsq",
 }
 TARGET_RECALL = 0.90
-NAME = "gist1M_qps_recall_0.90.pdf"
+NAME = "paper_qps_recall_0.90.pdf"
 
 # ── Paths ──────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(SCRIPT_DIR, "..", "results")
 FIGURES_DIR = os.path.join("/common/home/jl3288/overleaf/quantization_benchmark", "figures", "hnsw", DATASET)
 LEGENDS_DIR = os.path.join("/common/home/jl3288/overleaf/quantization_benchmark", "figures", "hnsw","legends")
+SymphonyQG_PATH = os.path.join("/common/home/jl3288/Desktop/anns/SymphonyQG/results", DATASET, "symphonyqg_eval.csv")
+HVS_PATH = os.path.join("/common/home/jl3288/Desktop/anns/hvs/results", DATASET+".out")
 
 os.makedirs(FIGURES_DIR, exist_ok=True)
 os.makedirs(LEGENDS_DIR, exist_ok=True)
@@ -52,6 +59,8 @@ STYLES = {
     "PQR":          {"color": "#7f7f7f", "marker": "*",  "linestyle": "-"},
     "LSQ":          {"color": "#bcbd22", "marker": "p",  "linestyle": "-"},
     "PLSQ":         {"color": "#17becf", "marker": "d",  "linestyle": "-"},
+    "SymphonyQG":   {"color": "#ff1493", "marker": "<",  "linestyle": "-"},
+    "HVS":          {"color": "#1b3a8a", "marker": ">",  "linestyle": "-"},
 }
 
 # ── Collect data ──────────────────────────────────────────────
@@ -88,6 +97,35 @@ for algo_name, algo_folder in ALGORITHMS.items():
     config_name = os.path.basename(best.filepath)
     print(f"[OK]   {algo_name}: selected {config_name}")
 
+# ── Add external baselines ────────────────────────────────────
+external_results = [
+    ("SymphonyQG", SymphonyQG_PATH, load_symphonyqg_result),
+    ("HVS", HVS_PATH, load_hvs_result),
+]
+
+for name, path, loader in external_results:
+    rf = loader(path)
+    if rf is None or not rf.entries:
+        print(f"[SKIP] {name}: no valid entries in {path}")
+        continue
+
+    entries = sorted(rf.entries, key=lambda e: e.recall)
+    recalls = [e.recall for e in entries]
+    qps_vals = [e.qps for e in entries]
+
+    style = STYLES.get(name, {"color": "gray", "marker": ".", "linestyle": "-"})
+    line, = ax.plot(
+        recalls, qps_vals,
+        marker=style["marker"],
+        color=style["color"],
+        linestyle=style["linestyle"],
+        linewidth=2,
+        markersize=6,
+        label=name,
+    )
+    legend_handles.append(line)
+    print(f"[OK]   {name}: loaded {os.path.basename(path)}")
+
 # ── Format axes ───────────────────────────────────────────────
 ax.set_xlabel("Recall@10")
 ax.set_ylabel("QPS")
@@ -101,19 +139,19 @@ fig.savefig(os.path.join(FIGURES_DIR, NAME), format='pdf', bbox_inches="tight")
 print(f"\nFigure saved to {os.path.join(FIGURES_DIR, NAME)}")
 
 # ── Save legend separately ────────────────────────────────────
-# if legend_handles:
-#     fig_leg = plt.figure()
-#     legend = fig_leg.legend(
-#         handles=legend_handles,
-#         loc="center",
-#         ncol=6,
-#         frameon=False,
-#         fontsize=12,
-#     )
-#     fig_leg.canvas.draw()
-#     bbox = legend.get_window_extent().transformed(fig_leg.dpi_scale_trans.inverted())
-#     legend_path = os.path.join(LEGENDS_DIR, NAME)
-#     fig_leg.savefig(legend_path, bbox_inches=bbox, pad_inches=0)
-#     print(f"Legend saved to {legend_path}")
+if legend_handles:
+    fig_leg = plt.figure()
+    legend = fig_leg.legend(
+        handles=legend_handles,
+        loc="center",
+        ncol=7,
+        frameon=False,
+        fontsize=12,
+    )
+    fig_leg.canvas.draw()
+    bbox = legend.get_window_extent().transformed(fig_leg.dpi_scale_trans.inverted())
+    legend_path = os.path.join(LEGENDS_DIR, NAME)
+    fig_leg.savefig(legend_path, bbox_inches=bbox, pad_inches=0)
+    print(f"Legend saved to {legend_path}")
 
 plt.close("all")

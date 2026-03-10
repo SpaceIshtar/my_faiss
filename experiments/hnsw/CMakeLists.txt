@@ -22,6 +22,9 @@ set(VAQ_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../VAQ)
 set(VAQ_INCLUDE_DIR ${VAQ_DIR}/bitvecengine)
 set(VAQ_EIGEN_DIR ${VAQ_DIR}/external/eigen)
 
+# OSQ reference implementation
+set(OSQ_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../OptimizedScalarQuantization)
+
 # Build VAQ as a static library (avoids multiple-definition errors from
 # non-inline functions in VAQ headers like Math.hpp, KMeans.hpp, etc.)
 # add_library(vaq_lib STATIC
@@ -73,8 +76,13 @@ target_link_libraries(bench_hnswpq PRIVATE faiss_avx512 OpenMP::OpenMP_CXX)
 # New benchmark framework with configurable quantization methods
 # ============================================================
 add_executable(bench_hnsw_quant EXCLUDE_FROM_ALL bench_hnsw_quant.cpp)
+target_sources(bench_hnsw_quant PRIVATE
+    ${OSQ_DIR}/OptimizedScalarQuantizer.cpp
+    ${OSQ_DIR}/OSQIndex.cpp
+)
 target_include_directories(bench_hnsw_quant PRIVATE
     ${HNSW_INCLUDE_DIR}
+    ${OSQ_DIR}
     ${RABITQ_INCLUDE_DIR}
     ${SAQ_INCLUDE_DIR}
     ${SAQ_CORE_INCLUDE_DIR}

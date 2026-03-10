@@ -185,13 +185,13 @@ def main():
     base_path = args.data_path or ds["base_path"]
     threads = args.threads or ds.get("threads", 16)
     k = ds.get("k", 10)
-    hnsw_M = ds.get("hnsw_M", 64)
+    hnsw_M = ds.get("hnsw_M", 32)
     hnsw_efc = ds.get("hnsw_efConstruction", 200)
     ef_values = ([int(x) for x in args.ef.split(",")] if args.ef
                  else ds.get("ef_search", [10, 20, 30, 50, 100, 200]))
     qtypes = sq_configs[sq_key]
 
-    faiss.omp_set_num_threads(threads)
+    faiss.omp_set_num_threads(16)
 
     print("=" * 50)
     print("IndexHNSWSQ Benchmark")
@@ -210,7 +210,7 @@ def main():
     xq = fvecs_read(os.path.join(base_path, ds["query_file"]))
     gt = ivecs_read(os.path.join(base_path, ds["groundtruth_file"]))
     print(f"Load time: {time.time() - t0:.1f}s")
-
+    xb = xb[:100000]
     nb, d = xb.shape
     nq = xq.shape[0]
     gt_k = gt.shape[1]
@@ -236,6 +236,7 @@ def main():
         index = faiss.IndexHNSWSQ(d, qtype, hnsw_M)
         index.hnsw.efConstruction = hnsw_efc
         index.train(xb)
+        faiss.omp_set_num_threads(1)
         index.add(xb)
         build_time = time.time() - t0
         print(f"Build time: {build_time:.1f}s")
