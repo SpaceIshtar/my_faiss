@@ -31,6 +31,12 @@ struct DiskANNDatasetConfig {
     std::string base_file = "sift_base.fvecs";
     std::string query_file = "sift_query.fvecs";
     std::string groundtruth_file = "sift_groundtruth.ivecs";
+    std::string data_type = "float";                  // float | uint8
+    std::string base_format = "fvecs";                // fvecs | fbin | u8bin
+    std::string query_format = "fvecs";               // fvecs | fbin | u8bin
+    std::string groundtruth_format = "ivecs";         // ivecs | ibin | truthset
+    size_t sample_num = 0;                            // 0 = use all (or auto for u8bin in quant bench)
+    size_t add_batch_size = 200000;                   // vectors per add() batch when conversion is needed
 
     // DiskANN graph parameters
     int diskann_R = 64;
@@ -102,6 +108,12 @@ inline std::map<std::string, DiskANNDatasetConfig> parse_diskann_datasets(
                 else if (key == "base_file") cfg.base_file = value;
                 else if (key == "query_file") cfg.query_file = value;
                 else if (key == "groundtruth_file") cfg.groundtruth_file = value;
+                else if (key == "data_type") cfg.data_type = value;
+                else if (key == "base_format") cfg.base_format = value;
+                else if (key == "query_format") cfg.query_format = value;
+                else if (key == "groundtruth_format") cfg.groundtruth_format = value;
+                else if (key == "sample_num") cfg.sample_num = std::stoull(value);
+                else if (key == "add_batch_size") cfg.add_batch_size = std::stoull(value);
                 else if (key == "diskann_R") cfg.diskann_R = std::stoi(value);
                 else if (key == "diskann_L_build") cfg.diskann_L_build = std::stoi(value);
                 else if (key == "diskann_index_prefix") cfg.diskann_index_prefix = value;

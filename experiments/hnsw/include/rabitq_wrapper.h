@@ -231,6 +231,22 @@ public:
     }
 
     void train(size_t n, const float* x) override {
+        if (n == 0 || x == nullptr) {
+            throw std::runtime_error("RaBitQWrapper::train requires non-empty input");
+        }
+        if (n < num_clusters_) {
+            throw std::runtime_error(
+                "RaBitQWrapper::train needs n >= num_clusters, got n=" +
+                std::to_string(n) + ", num_clusters=" + std::to_string(num_clusters_));
+        }
+
+        std::cout << "[RaBitQ train] n=" << n
+                  << ", d=" << d_
+                  << ", padded_d=" << padded_dim_
+                  << ", bits=" << total_bits_
+                  << ", clusters=" << num_clusters_
+                  << std::endl;
+
         // Use FAISS Clustering for KMeans
         faiss::ClusteringParameters cp;
         cp.niter = 25;
@@ -241,23 +257,29 @@ public:
         faiss::IndexFlatL2 index(d_);
 
         // Run clustering
+        std::cout << "[RaBitQ train] running FAISS clustering" << std::endl;
         clus.train(n, x, index);
+        std::cout << "[RaBitQ train] clustering finished" << std::endl;
 
         // Store centroids
         centroids_.resize(num_clusters_ * d_);
         std::memcpy(centroids_.data(), clus.centroids.data(), num_clusters_ * d_ * sizeof(float));
 
         // Rotate centroids
+        std::cout << "[RaBitQ train] rotating centroids" << std::endl;
         for (size_t i = 0; i < num_clusters_; i++) {
             rotator_->rotate(
                 centroids_.data() + i * d_,
                 rotated_centroids_.data() + i * padded_dim_
             );
         }
+        std::cout << "[RaBitQ train] centroid rotation finished" << std::endl;
 
         // Build quantizer for fast cluster assignment
+        std::cout << "[RaBitQ train] building centroid quantizer" << std::endl;
         quantizer_.reset(new faiss::IndexFlatL2(d_));
         quantizer_->add(num_clusters_, centroids_.data());
+        std::cout << "[RaBitQ train] quantizer ready" << std::endl;
 
         is_trained_ = true;
     }

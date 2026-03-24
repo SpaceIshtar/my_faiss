@@ -825,11 +825,24 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
     this->_aligned_dim = ROUND_UP(pq_file_dim, 8);
 
     size_t npts_u64, nchunks_u64;
+    if (this->_skip_in_memory_pq_data)
+    {
 #ifdef EXEC_ENV_OLS
-    diskann::load_bin<uint8_t>(files, pq_compressed_vectors, this->data, npts_u64, nchunks_u64);
+        get_bin_metadata(files, pq_compressed_vectors, npts_u64, nchunks_u64);
 #else
-    diskann::load_bin<uint8_t>(pq_compressed_vectors, this->data, npts_u64, nchunks_u64);
+        get_bin_metadata(pq_compressed_vectors, npts_u64, nchunks_u64);
 #endif
+        this->data = nullptr;
+        diskann::cout << "Skipping load of in-memory PQ compressed vectors; only metadata is kept." << std::endl;
+    }
+    else
+    {
+#ifdef EXEC_ENV_OLS
+        diskann::load_bin<uint8_t>(files, pq_compressed_vectors, this->data, npts_u64, nchunks_u64);
+#else
+        diskann::load_bin<uint8_t>(pq_compressed_vectors, this->data, npts_u64, nchunks_u64);
+#endif
+    }
 
     this->_num_points = npts_u64;
     this->_n_chunks = nchunks_u64;
@@ -978,9 +991,12 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
     _pq_table.load_pq_centroid_bin(pq_table_bin.c_str(), nchunks_u64);
 #endif
 
-    diskann::cout << "Loaded PQ centroids and in-memory compressed vectors. #points: " << _num_points
-                  << " #dim: " << _data_dim << " #aligned_dim: " << _aligned_dim << " #chunks: " << _n_chunks
-                  << std::endl;
+    diskann::cout << "Loaded PQ metadata"
+                  << ". #points: " << _num_points
+                  << " #dim: " << _data_dim << " #aligned_dim: " << _aligned_dim << " #chunks: " << _n_chunks;
+    if (!_skip_in_memory_pq_data)
+        diskann::cout << " (compressed vectors resident in memory)";
+    diskann::cout << std::endl;
 
     if (_n_chunks > MAX_PQ_CHUNKS)
     {
@@ -1054,6 +1070,7 @@ int PQFlashIndex<T, LabelT>::load_from_separate_paths(uint32_t num_threads, cons
     READ_U64(index_metadata, medoid_id_on_file);
     READ_U64(index_metadata, _max_node_len);
     READ_U64(index_metadata, _nnodes_per_sector);
+    diskann::cout << "_max_node_len: " << _max_node_len << ", _disk_bytes_per_point: "<< _disk_bytes_per_point << std::endl;
     _max_degree = ((_max_node_len - _disk_bytes_per_point) / sizeof(uint32_t)) - 1;
 
     if (_max_degree > defaults::MAX_GRAPH_DEGREE)
@@ -1803,6 +1820,10 @@ template <typename T, typename LabelT> char *PQFlashIndex<T, LabelT>::getHeaderB
 template <typename T, typename LabelT>
 std::vector<std::uint8_t> PQFlashIndex<T, LabelT>::get_pq_vector(std::uint64_t vid)
 {
+    if (this->data == nullptr)
+    {
+        throw ANNException("In-memory PQ compressed vectors were not loaded.", -1, __FUNCSIG__, __FILE__, __LINE__);
+    }
     std::uint8_t *pqVec = &this->data[vid * this->_n_chunks];
     return std::vector<std::uint8_t>(pqVec, pqVec + this->_n_chunks);
 }
@@ -1840,6 +1861,16 @@ void PQFlashIndex<T, LabelT>::set_distance_computer_factory(DCFactory factory)
         _use_faiss_quantization = false;
         diskann::cout << "PQFlashIndex: Using generic distance computer factory for distance estimation"
                       << std::endl;
+    }
+}
+
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::set_skip_in_memory_pq_data(bool skip)
+{
+    _skip_in_memory_pq_data = skip;
+    if (skip)
+    {
+        diskann::cout << "PQFlashIndex: will skip loading in-memory PQ compressed vectors" << std::endl;
     }
 }
 

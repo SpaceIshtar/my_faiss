@@ -16,7 +16,7 @@
  *
  * Options:
  *   --dataset <name>           Dataset name (e.g., sift1M)
- *   --algorithm <name>         Algorithm name (pq, sq, opq, rq, lsq, prq, plsq, vaq, rabitq)
+ *   --algorithm <name>         Algorithm name (pq, sq, opq, osq, rq, lsq, prq, plsq, vaq, rabitq)
  *   --config-dir <path>        Config directory (default: ./config)
  *   --algo-config-dir <path>   Algorithm config directory (default: config-dir)
  *   --data-path <path>         Override dataset base path
@@ -31,13 +31,16 @@
  */
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -56,6 +59,7 @@
 // Shared quantization wrappers (from HNSW framework)
 #include "../hnsw/include/aq_wrapper.h"
 #include "../hnsw/include/opq_wrapper.h"
+#include "../hnsw/include/osq_wrapper.h"
 #include "../hnsw/include/pq_wrapper.h"
 #include "../hnsw/include/quant_wrapper.h"
 #include "../hnsw/include/rabitq_wrapper.h"
@@ -97,6 +101,203 @@ float compute_recall_at_k_u64(
     return total_hits / float(nq * k);
 }
 
+namespace {
+
+std::string to_lower_copy(const std::string& s) {
+    std::string out = s;
+    for (char& c : out) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
+
+bool ends_with(const std::string& s, const std::string& suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string infer_vector_format(const std::string& configured, const std::string& path) {
+    std::string fmt = to_lower_copy(configured);
+    if (!fmt.empty() && fmt != "auto") {
+        return fmt;
+    }
+    std::string lower_path = to_lower_copy(path);
+    if (ends_with(lower_path, ".fvecs")) return "fvecs";
+    if (ends_with(lower_path, ".u8bin")) return "u8bin";
+    if (ends_with(lower_path, ".fbin")) return "fbin";
+    return "fvecs";
+}
+
+std::string infer_groundtruth_format(const std::string& configured, const std::string& path) {
+    std::string fmt = to_lower_copy(configured);
+    if (!fmt.empty() && fmt != "auto") {
+        return fmt;
+    }
+    std::string lower_path = to_lower_copy(path);
+    if (ends_with(lower_path, ".ivecs")) return "ivecs";
+    if (ends_with(lower_path, ".ibin")) return "ibin";
+    return "truthset";
+}
+
+void read_u8bin_header(const std::string& path, size_t& n, size_t& d) {
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs.is_open()) {
+        throw std::runtime_error("Failed to open u8bin file: " + path);
+    }
+    int32_t n_i32 = 0, d_i32 = 0;
+    ifs.read(reinterpret_cast<char*>(&n_i32), sizeof(int32_t));
+    ifs.read(reinterpret_cast<char*>(&d_i32), sizeof(int32_t));
+    if (!ifs || n_i32 <= 0 || d_i32 <= 0) {
+        throw std::runtime_error("Invalid u8bin header: " + path);
+    }
+    n = static_cast<size_t>(n_i32);
+    d = static_cast<size_t>(d_i32);
+}
+
+void read_fbin_header(const std::string& path, size_t& n, size_t& d) {
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs.is_open()) {
+        throw std::runtime_error("Failed to open fbin file: " + path);
+    }
+    int32_t n_i32 = 0, d_i32 = 0;
+    ifs.read(reinterpret_cast<char*>(&n_i32), sizeof(int32_t));
+    ifs.read(reinterpret_cast<char*>(&d_i32), sizeof(int32_t));
+    if (!ifs || n_i32 <= 0 || d_i32 <= 0) {
+        throw std::runtime_error("Invalid fbin header: " + path);
+    }
+    n = static_cast<size_t>(n_i32);
+    d = static_cast<size_t>(d_i32);
+}
+
+float* load_query_as_float(
+        const std::string& query_path,
+        const std::string& configured_format,
+        size_t& d,
+        size_t& nq) {
+    const std::string fmt = infer_vector_format(configured_format, query_path);
+    if (fmt == "fvecs") {
+        return fvecs_read(query_path.c_str(), &d, &nq);
+    }
+    if (fmt == "fbin") {
+        float* xq = nullptr;
+        diskann::load_bin<float>(query_path, xq, nq, d);
+        return xq;
+    }
+    if (fmt == "u8bin") {
+        uint8_t* xq_u8 = nullptr;
+        diskann::load_bin<uint8_t>(query_path, xq_u8, nq, d);
+        float* xq = new float[nq * d];
+        for (size_t i = 0; i < nq * d; ++i) {
+            xq[i] = static_cast<float>(xq_u8[i]);
+        }
+        delete[] xq_u8;
+        return xq;
+    }
+    throw std::runtime_error("Unsupported query format: " + fmt);
+}
+
+uint8_t* load_query_as_u8(
+        const std::string& query_path,
+        const std::string& configured_format,
+        size_t& d,
+        size_t& nq) {
+    const std::string fmt = infer_vector_format(configured_format, query_path);
+    if (fmt == "u8bin") {
+        uint8_t* xq = nullptr;
+        diskann::load_bin<uint8_t>(query_path, xq, nq, d);
+        return xq;
+    }
+    if (fmt == "fvecs" || fmt == "fbin") {
+        float* xqf = nullptr;
+        if (fmt == "fvecs") {
+            xqf = fvecs_read(query_path.c_str(), &d, &nq);
+        } else {
+            diskann::load_bin<float>(query_path, xqf, nq, d);
+        }
+        if (!xqf) {
+            return nullptr;
+        }
+        uint8_t* xq = new uint8_t[nq * d];
+        for (size_t i = 0; i < nq * d; ++i) {
+            float v = xqf[i];
+            if (v < 0.0f) v = 0.0f;
+            if (v > 255.0f) v = 255.0f;
+            xq[i] = static_cast<uint8_t>(v);
+        }
+        delete[] xqf;
+        return xq;
+    }
+    throw std::runtime_error("Unsupported query format: " + fmt);
+}
+
+int* load_groundtruth_ids(
+        const std::string& gt_path,
+        const std::string& configured_format,
+        size_t& gt_k,
+        size_t expected_nq) {
+    const std::string fmt = infer_groundtruth_format(configured_format, gt_path);
+    size_t gt_nq = 0;
+
+    if (fmt == "ivecs") {
+        int* gt = ivecs_read(gt_path.c_str(), &gt_k, &gt_nq);
+        if (!gt) {
+            throw std::runtime_error("Failed to load ivecs groundtruth: " + gt_path);
+        }
+        if (gt_nq != expected_nq) {
+            throw std::runtime_error("Groundtruth nq mismatch with query count");
+        }
+        return gt;
+    }
+
+    if (fmt == "ibin") {
+        uint32_t* gt_u32 = nullptr;
+        diskann::load_bin<uint32_t>(gt_path, gt_u32, gt_nq, gt_k);
+        if (gt_nq != expected_nq) {
+            delete[] gt_u32;
+            throw std::runtime_error("Groundtruth nq mismatch with query count");
+        }
+        int* gt = new int[gt_nq * gt_k];
+        for (size_t i = 0; i < gt_nq * gt_k; ++i) {
+            if (gt_u32[i] > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+                delete[] gt_u32;
+                delete[] gt;
+                throw std::runtime_error("Groundtruth id exceeds int range");
+            }
+            gt[i] = static_cast<int>(gt_u32[i]);
+        }
+        delete[] gt_u32;
+        return gt;
+    }
+
+    if (fmt == "truthset") {
+        uint32_t* gt_ids = nullptr;
+        float* gt_dists = nullptr;
+        diskann::load_truthset(gt_path, gt_ids, gt_dists, gt_nq, gt_k);
+        if (gt_nq != expected_nq) {
+            delete[] gt_ids;
+            delete[] gt_dists;
+            throw std::runtime_error("Groundtruth nq mismatch with query count");
+        }
+        int* gt = new int[gt_nq * gt_k];
+        for (size_t i = 0; i < gt_nq * gt_k; ++i) {
+            if (gt_ids[i] > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+                delete[] gt_ids;
+                delete[] gt_dists;
+                delete[] gt;
+                throw std::runtime_error("Groundtruth id exceeds int range");
+            }
+            gt[i] = static_cast<int>(gt_ids[i]);
+        }
+        delete[] gt_ids;
+        delete[] gt_dists;
+        return gt;
+    }
+
+    throw std::runtime_error("Unsupported groundtruth format: " + fmt);
+}
+
+} // namespace
+
 /*****************************************************
  * Benchmark runner
  *****************************************************/
@@ -110,9 +311,10 @@ struct BenchmarkResult {
     SearchStats stats;
 };
 
+template <typename T>
 std::vector<BenchmarkResult> run_benchmark(
-        diskann::PQFlashIndex<float>* flash_index,
-        const float* xq,
+        diskann::PQFlashIndex<T>* flash_index,
+        const T* xq,
         size_t nq,
         size_t d,
         const int* gt,
@@ -314,6 +516,8 @@ std::unique_ptr<QuantWrapper> create_wrapper(
         return create_pq_wrapper(d, metric, params);
     } else if (algorithm == "opq") {
         return create_opq_wrapper(d, metric, params);
+    } else if (algorithm == "osq") {
+        return create_osq_wrapper(d, metric, params);
     } else if (algorithm == "sq") {
         return create_sq_wrapper(d, metric, params);
     } else if (algorithm == "rq") {
@@ -355,7 +559,7 @@ void print_usage(const char* prog) {
     std::cout << "Usage: " << prog << " --dataset <name> --algorithm <name> [options]\n\n"
               << "Options:\n"
               << "  --dataset <name>           Dataset name (e.g., sift1M)\n"
-              << "  --algorithm <name>         Algorithm (pq, opq, sq, rq, lsq, prq, plsq, vaq, rabitq, saq)\n"
+              << "  --algorithm <name>         Algorithm (pq, opq, osq, sq, rq, lsq, prq, plsq, vaq, rabitq, saq)\n"
               << "  --config-dir <path>        Config directory (default: ./config)\n"
               << "  --algo-config-dir <path>   Algorithm config directory (default: config-dir)\n"
               << "  --data-path <path>         Override dataset base path\n"
@@ -484,6 +688,9 @@ int main(int argc, char** argv) {
         } else if (opts.algorithm == "sq") {
             param_sets.push_back({.params = {{"qtype", "QT_8bit"}}});
             param_sets.push_back({.params = {{"qtype", "QT_4bit"}}});
+        } else if (opts.algorithm == "osq") {
+            param_sets.push_back({.params = {{"encoding", "PACKED_NIBBLE"}, {"similarity", "EUCLIDEAN"}}});
+            param_sets.push_back({.params = {{"encoding", "SEVEN_BIT"}, {"similarity", "EUCLIDEAN"}}});
         } else if (opts.algorithm == "rq") {
             param_sets.push_back({.params = {{"M", "8"}, {"nbits", "8"}}});
             param_sets.push_back({.params = {{"M", "16"}, {"nbits", "8"}}});
@@ -512,13 +719,58 @@ int main(int argc, char** argv) {
 
     // Load data
     std::cout << "\n[Loading data...]" << std::endl;
-    size_t d, nb, nq, gt_k;
-    float* xb = fvecs_read(ds_cfg.get_path(ds_cfg.base_file).c_str(), &d, &nb);
-    float* xq = fvecs_read(ds_cfg.get_path(ds_cfg.query_file).c_str(), &d, &nq);
-    int* gt = ivecs_read(ds_cfg.get_path(ds_cfg.groundtruth_file).c_str(), &gt_k, &nq);
+    size_t d = 0, nb = 0, nq = 0, gt_k = 0;
+    size_t query_d = 0;
+    float* xb = nullptr;
+    float* xq_float = nullptr;
+    uint8_t* xq_u8 = nullptr;
+    int* gt = nullptr;
+    const std::string base_path = ds_cfg.get_path(ds_cfg.base_file);
+    const std::string query_path = ds_cfg.get_path(ds_cfg.query_file);
+    const std::string gt_path = ds_cfg.get_path(ds_cfg.groundtruth_file);
+    const std::string base_fmt = infer_vector_format(ds_cfg.base_format, base_path);
+    const std::string data_type = to_lower_copy(ds_cfg.data_type);
+    const bool use_uint8_index = (data_type == "uint8" || data_type == "u8");
 
-    if (!xb || !xq || !gt) {
+    try {
+        if (base_fmt == "u8bin") {
+            read_u8bin_header(base_path, nb, d);
+            std::cout << "Base format: u8bin (streaming mode)" << std::endl;
+        } else if (base_fmt == "fbin") {
+            read_fbin_header(base_path, nb, d);
+            xb = nullptr;
+            std::cout << "Base format: fbin (streaming mode)" << std::endl;
+        } else {
+            xb = fvecs_read(base_path.c_str(), &d, &nb);
+        }
+
+        if (use_uint8_index) {
+            xq_u8 = load_query_as_u8(query_path, ds_cfg.query_format, query_d, nq);
+        } else {
+            xq_float = load_query_as_float(query_path, ds_cfg.query_format, query_d, nq);
+        }
+        if (query_d != d) {
+            throw std::runtime_error(
+                "Dimension mismatch: base d=" + std::to_string(d) +
+                ", query d=" + std::to_string(query_d));
+        }
+        gt = load_groundtruth_ids(gt_path, ds_cfg.groundtruth_format, gt_k, nq);
+    } catch (const std::exception& e) {
+        std::cerr << "Error loading data files: " << e.what() << std::endl;
+        delete[] xb;
+        delete[] xq_float;
+        delete[] xq_u8;
+        delete[] gt;
+        return 1;
+    }
+
+    if (((use_uint8_index && !xq_u8) || (!use_uint8_index && !xq_float)) ||
+        !gt || ((base_fmt != "u8bin" && base_fmt != "fbin") && !xb)) {
         std::cerr << "Error: Failed to load data files" << std::endl;
+        delete[] xb;
+        delete[] xq_float;
+        delete[] xq_u8;
+        delete[] gt;
         return 1;
     }
 
@@ -531,69 +783,177 @@ int main(int argc, char** argv) {
     std::cout << "Index prefix: " << index_prefix << std::endl;
 
     std::shared_ptr<AlignedFileReader> reader(new LinuxAlignedFileReader());
-    std::unique_ptr<diskann::PQFlashIndex<float>> flash_index(
-        new diskann::PQFlashIndex<float>(reader, diskann::Metric::L2));
-
     Timer timer;
-    int load_result = flash_index->load(ds_cfg.threads, index_prefix.c_str());
-    if (load_result != 0) {
-        std::cerr << "Error loading DiskANN index: " << load_result << std::endl;
-        return load_result;
+
+    auto run_with_index = [&](auto& flash_index, const auto* xq) -> int {
+        int load_result = flash_index->load(ds_cfg.threads, index_prefix.c_str());
+        if (load_result != 0) {
+            std::cerr << "Error loading DiskANN index: " << load_result << std::endl;
+            return load_result;
+        }
+        std::cout << "DiskANN index load time: " << timer.elapsed_ms() << " ms" << std::endl;
+
+        // Cache BFS levels for faster search
+        std::vector<uint32_t> node_list;
+        flash_index->cache_bfs_levels(ds_cfg.num_nodes_to_cache, node_list);
+        flash_index->load_cache_list(node_list);
+        std::cout << "Cached " << ds_cfg.num_nodes_to_cache << " nodes" << std::endl;
+
+        // Run benchmarks for each parameter set
+        for (const auto& ps : param_sets) {
+            std::cout << "\n==================================================" << std::endl;
+            std::cout << "Algorithm: " << opts.algorithm << " | Params: " << ps.to_string() << std::endl;
+            std::cout << "==================================================" << std::endl;
+
+            // Create quantizer wrapper
+            auto quant = create_wrapper(opts.algorithm, d, faiss::METRIC_L2, ps.params);
+
+            // Train and add vectors
+            std::cout << "[Training " << quant->get_name() << "...]" << std::endl;
+            timer.reset();
+            if (base_fmt == "u8bin") {
+                size_t train_n = ds_cfg.sample_num > 0 ? std::min(ds_cfg.sample_num, nb) : 0;
+                if (train_n == 0) {
+                    train_n = std::min<size_t>(nb, 200000);
+                    std::cout << "sample_num is not set; auto-using sample_num=" << train_n
+                              << " for quantizer training on u8bin data" << std::endl;
+                }
+
+                std::ifstream base_ifs(base_path, std::ios::binary);
+                if (!base_ifs.is_open()) {
+                    std::cerr << "Error: failed to open base u8bin file: " << base_path << std::endl;
+                    return 1;
+                }
+                base_ifs.seekg(2 * sizeof(int32_t), std::ios::beg);
+
+                std::vector<uint8_t> sample_u8(train_n * d);
+                base_ifs.read(reinterpret_cast<char*>(sample_u8.data()), sample_u8.size());
+                if (!base_ifs || static_cast<size_t>(base_ifs.gcount()) != sample_u8.size()) {
+                    std::cerr << "Error: failed to read sample vectors from u8bin base file" << std::endl;
+                    return 1;
+                }
+                std::vector<float> sample_f(train_n * d);
+                for (size_t i = 0; i < sample_u8.size(); ++i) {
+                    sample_f[i] = static_cast<float>(sample_u8[i]);
+                }
+                quant->train(train_n, sample_f.data());
+
+                const size_t batch_size = std::max<size_t>(1, ds_cfg.add_batch_size);
+                std::vector<uint8_t> batch_u8(batch_size * d);
+                std::vector<float> batch_f(batch_size * d);
+                base_ifs.clear();
+                base_ifs.seekg(2 * sizeof(int32_t), std::ios::beg);
+
+                size_t added = 0;
+                while (added < nb) {
+                    const size_t cur = std::min(batch_size, nb - added);
+                    const size_t cur_bytes = cur * d;
+                    base_ifs.read(reinterpret_cast<char*>(batch_u8.data()), cur_bytes);
+                    if (!base_ifs || static_cast<size_t>(base_ifs.gcount()) != cur_bytes) {
+                        std::cerr << "Error: failed while batch-reading u8bin base file at vector " << added << std::endl;
+                        return 1;
+                    }
+                    for (size_t i = 0; i < cur_bytes; ++i) {
+                        batch_f[i] = static_cast<float>(batch_u8[i]);
+                    }
+                    quant->add(cur, batch_f.data());
+                    added += cur;
+                }
+            } else if (base_fmt == "fbin") {
+                size_t train_n = ds_cfg.sample_num > 0 ? std::min(ds_cfg.sample_num, nb) : 0;
+                if (train_n == 0) {
+                    train_n = std::min<size_t>(nb, 200000);
+                    std::cout << "sample_num is not set; auto-using sample_num=" << train_n
+                              << " for quantizer training on fbin data" << std::endl;
+                }
+
+                std::ifstream base_ifs(base_path, std::ios::binary);
+                if (!base_ifs.is_open()) {
+                    std::cerr << "Error: failed to open base fbin file: " << base_path << std::endl;
+                    return 1;
+                }
+                base_ifs.seekg(2 * sizeof(int32_t), std::ios::beg);
+
+                std::vector<float> sample_f(train_n * d);
+                const size_t sample_bytes = sample_f.size() * sizeof(float);
+                base_ifs.read(reinterpret_cast<char*>(sample_f.data()), sample_bytes);
+                if (!base_ifs || static_cast<size_t>(base_ifs.gcount()) != sample_bytes) {
+                    std::cerr << "Error: failed to read sample vectors from fbin base file" << std::endl;
+                    return 1;
+                }
+                quant->train(train_n, sample_f.data());
+
+                const size_t batch_size = std::max<size_t>(1, ds_cfg.add_batch_size);
+                std::vector<float> batch_f(batch_size * d);
+                base_ifs.clear();
+                base_ifs.seekg(2 * sizeof(int32_t), std::ios::beg);
+
+                size_t added = 0;
+                while (added < nb) {
+                    const size_t cur = std::min(batch_size, nb - added);
+                    const size_t cur_bytes = cur * d * sizeof(float);
+                    base_ifs.read(reinterpret_cast<char*>(batch_f.data()), cur_bytes);
+                    if (!base_ifs || static_cast<size_t>(base_ifs.gcount()) != cur_bytes) {
+                        std::cerr << "Error: failed while batch-reading fbin base file at vector " << added << std::endl;
+                        return 1;
+                    }
+                    quant->add(cur, batch_f.data());
+                    added += cur;
+                }
+            } else {
+                const size_t train_n = ds_cfg.sample_num > 0 ? std::min(ds_cfg.sample_num, nb) : nb;
+                quant->train(train_n, xb);
+                std::cout << "Training ends on samples, start one-shot add" << std::endl;
+                quant->add(nb, xb);
+            }
+            std::cout << "Train+add time: " << timer.elapsed_ms() << " ms" << std::endl;
+
+            flash_index->set_distance_computer_factory([&quant]() {
+                return quant->get_distance_computer();
+            });
+
+            std::cout << "\n" << std::setw(8) << "L"
+                      << std::setw(12) << "QPS"
+                      << std::setw(12) << "Recall@" << ds_cfg.k
+                      << std::setw(12) << "Latency(ms)"
+                      << std::setw(12) << "ndis_mean"
+                      << std::setw(12) << "nhops_mean" << std::endl;
+            std::cout << std::string(68, '-') << std::endl;
+
+            auto results = run_benchmark(
+                flash_index.get(), xq, nq, d, gt, gt_k, ds_cfg.k,
+                ds_cfg.L_search_values, ds_cfg.beam_width, ds_cfg.threads);
+
+            std::string quant_params = quant->get_params_string();
+            std::string result_filename = generate_result_filename(
+                opts.algorithm, quant_params, ds_cfg.diskann_R, ds_cfg.diskann_L_build);
+            std::string result_dir = "experiments/DiskANN/results/" + opts.dataset + "/" + opts.algorithm;
+            std::string result_path = result_dir + "/" + result_filename;
+
+            save_results_to_file(
+                result_path, opts.dataset, opts.algorithm, quant_params,
+                ds_cfg.diskann_R, ds_cfg.diskann_L_build, ds_cfg.beam_width,
+                nq, ds_cfg.k, results);
+        }
+        return 0;
+    };
+
+    int status = 0;
+    if (use_uint8_index) {
+        auto flash_index = std::make_unique<diskann::PQFlashIndex<uint8_t>>(reader, diskann::Metric::L2);
+        flash_index->set_skip_in_memory_pq_data(true);
+        status = run_with_index(flash_index, xq_u8);
+    } else {
+        auto flash_index = std::make_unique<diskann::PQFlashIndex<float>>(reader, diskann::Metric::L2);
+        flash_index->set_skip_in_memory_pq_data(true);
+        status = run_with_index(flash_index, xq_float);
     }
-    std::cout << "DiskANN index load time: " << timer.elapsed_ms() << " ms" << std::endl;
-
-    // Cache BFS levels for faster search
-    std::vector<uint32_t> node_list;
-    flash_index->cache_bfs_levels(ds_cfg.num_nodes_to_cache, node_list);
-    flash_index->load_cache_list(node_list);
-    std::cout << "Cached " << ds_cfg.num_nodes_to_cache << " nodes" << std::endl;
-
-    // Run benchmarks for each parameter set
-    for (const auto& ps : param_sets) {
-        std::cout << "\n==================================================" << std::endl;
-        std::cout << "Algorithm: " << opts.algorithm << " | Params: " << ps.to_string() << std::endl;
-        std::cout << "==================================================" << std::endl;
-
-        // Create quantizer wrapper
-        auto quant = create_wrapper(opts.algorithm, d, faiss::METRIC_L2, ps.params);
-
-        // Train and add vectors
-        std::cout << "[Training " << quant->get_name() << "...]" << std::endl;
-        timer.reset();
-        quant->train(nb, xb);
-        quant->add(nb, xb);
-        std::cout << "Train+add time: " << timer.elapsed_ms() << " ms" << std::endl;
-
-        // Set the distance computer factory on the DiskANN index
-        flash_index->set_distance_computer_factory([&quant]() {
-            return quant->get_distance_computer();
-        });
-
-        // Print results header
-        std::cout << "\n" << std::setw(8) << "L"
-                  << std::setw(12) << "QPS"
-                  << std::setw(12) << "Recall@" << ds_cfg.k
-                  << std::setw(12) << "Latency(ms)"
-                  << std::setw(12) << "ndis_mean"
-                  << std::setw(12) << "nhops_mean" << std::endl;
-        std::cout << std::string(68, '-') << std::endl;
-
-        // Run benchmark
-        auto results = run_benchmark(
-            flash_index.get(), xq, nq, d, gt, gt_k, ds_cfg.k,
-            ds_cfg.L_search_values, ds_cfg.beam_width, ds_cfg.threads);
-
-        // Save results to file
-        std::string quant_params = quant->get_params_string();
-        std::string result_filename = generate_result_filename(
-            opts.algorithm, quant_params, ds_cfg.diskann_R, ds_cfg.diskann_L_build);
-        std::string result_dir = "experiments/DiskANN/results/" + opts.dataset + "/" + opts.algorithm;
-        std::string result_path = result_dir + "/" + result_filename;
-
-        save_results_to_file(
-            result_path, opts.dataset, opts.algorithm, quant_params,
-            ds_cfg.diskann_R, ds_cfg.diskann_L_build, ds_cfg.beam_width,
-            nq, ds_cfg.k, results);
+    if (status != 0) {
+        delete[] xb;
+        delete[] xq_float;
+        delete[] xq_u8;
+        delete[] gt;
+        return status;
     }
 
     std::cout << "\nTotal time: " << std::fixed << std::setprecision(1)
@@ -601,7 +961,8 @@ int main(int argc, char** argv) {
 
     // Cleanup
     delete[] xb;
-    delete[] xq;
+    delete[] xq_float;
+    delete[] xq_u8;
     delete[] gt;
 
     return 0;

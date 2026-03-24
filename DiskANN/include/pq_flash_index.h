@@ -127,6 +127,11 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     using DCFactory = std::function<std::unique_ptr<faiss::DistanceComputer>()>;
     DISKANN_DLLEXPORT void set_distance_computer_factory(DCFactory factory);
 
+    // Skip loading the in-memory PQ compressed codes. This is useful when
+    // search will rely on an external distance computer instead of DiskANN's
+    // native in-memory PQ distance path.
+    DISKANN_DLLEXPORT void set_skip_in_memory_pq_data(bool skip);
+
     // Check if FAISS quantization is being used
     DISKANN_DLLEXPORT bool using_faiss_quantization() const;
 
@@ -258,6 +263,7 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
 
     // FAISS quantization support (alternative to PQ)
     faiss::IndexFlatCodes *_faiss_index = nullptr;  // externally owned, not managed by this class
+    bool _skip_in_memory_pq_data = false;
     bool _use_faiss_quantization = false;
 
     // Generic distance computer factory (supports any DistanceComputer)

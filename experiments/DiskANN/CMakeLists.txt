@@ -63,9 +63,15 @@ message(STATUS "MKL INCLUDE DIR: ${MKL_INCLUDE_DIR}")
 
 # Find Boost
 find_package(Boost COMPONENTS program_options)
+find_package(OpenMP REQUIRED)
 
 # Common compile definitions for DiskANN
-set(DISKANN_COMPILE_DEFS -DMKL_ILP64)
+#
+# Faiss already discovers and links its BLAS / MKL stack. If we force a second
+# MKL variant here (ILP64 + Intel OpenMP) while Faiss brings in LP64 +
+# GNU-threaded MKL, the final benchmark binary ends up with conflicting MKL /
+# OpenMP runtimes. Keep the benchmark targets on the same ABI/runtime as Faiss.
+set(DISKANN_COMPILE_DEFS)
 
 # Common compile options for DiskANN (SSE/AVX intrinsics)
 set(DISKANN_COMPILE_OPTS -march=native)
@@ -77,15 +83,6 @@ set(DISKANN_LINK_LIBS
     m
     dl
 )
-
-if(MKL_FOUND)
-    list(APPEND DISKANN_LINK_LIBS
-        mkl_intel_ilp64
-        mkl_intel_thread
-        mkl_core
-        iomp5
-    )
-endif()
 
 # HNSW include dir (for shared bench_config.h from diskann_bench_config.h)
 set(HNSW_EXP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../hnsw)
@@ -100,8 +97,9 @@ target_include_directories(build_diskann_index PRIVATE
 target_compile_definitions(build_diskann_index PRIVATE ${DISKANN_COMPILE_DEFS})
 target_compile_options(build_diskann_index PRIVATE -fopenmp ${DISKANN_COMPILE_OPTS} -include xmmintrin.h)
 target_link_libraries(build_diskann_index PRIVATE
-    faiss
+    faiss_avx512
     ${DISKANN_LINK_LIBS}
+    OpenMP::OpenMP_CXX
 )
 if(MKL_FOUND AND MKL_LIBRARY_DIR)
     target_link_directories(build_diskann_index PRIVATE ${MKL_LIBRARY_DIR})
@@ -122,8 +120,9 @@ target_include_directories(bench_diskann_faiss_sq PRIVATE
 target_compile_definitions(bench_diskann_faiss_sq PRIVATE ${DISKANN_COMPILE_DEFS})
 target_compile_options(bench_diskann_faiss_sq PRIVATE -fopenmp ${DISKANN_COMPILE_OPTS} -include xmmintrin.h)
 target_link_libraries(bench_diskann_faiss_sq PRIVATE
-    faiss
+    faiss_avx512
     ${DISKANN_LINK_LIBS}
+    OpenMP::OpenMP_CXX
 )
 if(MKL_FOUND AND MKL_LIBRARY_DIR)
     target_link_directories(bench_diskann_faiss_sq PRIVATE ${MKL_LIBRARY_DIR})
@@ -142,6 +141,9 @@ endif()
 # RaBitQ library
 set(RABITQ_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../RaBitQ-Library/include)
 
+# OSQ library
+set(OSQ_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../OptimizedScalarQuantization)
+
 # SAQ library
 set(SAQ_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../SAQ-Library/include)
 set(SAQ_CORE_INCLUDE_DIR ${SAQ_INCLUDE_DIR}/saqlib)
@@ -152,10 +154,15 @@ set(VAQ_INCLUDE_DIR ${VAQ_DIR}/bitvecengine)
 set(VAQ_EIGEN_DIR ${VAQ_DIR}/external/eigen)
 
 add_executable(bench_diskann_quant EXCLUDE_FROM_ALL bench_diskann_quant.cpp ${DISKANN_SOURCES})
+target_sources(bench_diskann_quant PRIVATE
+    ${OSQ_DIR}/OptimizedScalarQuantizer.cpp
+    ${OSQ_DIR}/OSQIndex.cpp
+)
 target_include_directories(bench_diskann_quant PRIVATE
     ${DISKANN_INCLUDE_DIR}
     ${MKL_INCLUDE_DIR}
     ${HNSW_EXP_DIR}
+    ${OSQ_DIR}
     ${RABITQ_INCLUDE_DIR}
     ${SAQ_INCLUDE_DIR}
     ${SAQ_CORE_INCLUDE_DIR}
@@ -165,9 +172,10 @@ target_include_directories(bench_diskann_quant PRIVATE
 target_compile_definitions(bench_diskann_quant PRIVATE ${DISKANN_COMPILE_DEFS} VAQ_OPTIMIZE EIGEN_DONT_PARALLELIZE)
 target_compile_options(bench_diskann_quant PRIVATE -fopenmp ${DISKANN_COMPILE_OPTS} -include xmmintrin.h -mavx2 -mfma)
 target_link_libraries(bench_diskann_quant PRIVATE
-    faiss
+    faiss_avx512
     -lglpk -larmadillo
     ${DISKANN_LINK_LIBS}
+    OpenMP::OpenMP_CXX
 )
 if(MKL_FOUND AND MKL_LIBRARY_DIR)
     target_link_directories(bench_diskann_quant PRIVATE ${MKL_LIBRARY_DIR})
@@ -192,6 +200,7 @@ target_compile_options(bench_diskann_standard PRIVATE -fopenmp ${DISKANN_COMPILE
 target_link_libraries(bench_diskann_standard PRIVATE
     faiss
     ${DISKANN_LINK_LIBS}
+    OpenMP::OpenMP_CXX
 )
 if(MKL_FOUND AND MKL_LIBRARY_DIR)
     target_link_directories(bench_diskann_standard PRIVATE ${MKL_LIBRARY_DIR})

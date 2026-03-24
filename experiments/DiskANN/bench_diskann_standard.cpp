@@ -29,11 +29,14 @@
  */
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -78,6 +81,173 @@ float compute_recall_at_k_u64(
     }
     return total_hits / float(nq * k);
 }
+
+namespace {
+
+std::string to_lower_copy(const std::string& s) {
+    std::string out = s;
+    for (char& c : out) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
+
+bool ends_with(const std::string& s, const std::string& suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string infer_vector_format(const std::string& configured, const std::string& path) {
+    std::string fmt = to_lower_copy(configured);
+    if (!fmt.empty() && fmt != "auto") {
+        return fmt;
+    }
+    std::string lower_path = to_lower_copy(path);
+    if (ends_with(lower_path, ".fvecs")) return "fvecs";
+    if (ends_with(lower_path, ".u8bin")) return "u8bin";
+    if (ends_with(lower_path, ".fbin")) return "fbin";
+    return "fvecs";
+}
+
+std::string infer_groundtruth_format(const std::string& configured, const std::string& path) {
+    std::string fmt = to_lower_copy(configured);
+    if (!fmt.empty() && fmt != "auto") {
+        return fmt;
+    }
+    std::string lower_path = to_lower_copy(path);
+    if (ends_with(lower_path, ".ivecs")) return "ivecs";
+    if (ends_with(lower_path, ".ibin")) return "ibin";
+    return "truthset";
+}
+
+float* load_query_as_float(
+        const std::string& query_path,
+        const std::string& configured_format,
+        size_t& d,
+        size_t& nq) {
+    const std::string fmt = infer_vector_format(configured_format, query_path);
+    if (fmt == "fvecs") {
+        return fvecs_read(query_path.c_str(), &d, &nq);
+    }
+    if (fmt == "fbin") {
+        float* xq = nullptr;
+        diskann::load_bin<float>(query_path, xq, nq, d);
+        return xq;
+    }
+    if (fmt == "u8bin") {
+        uint8_t* xq_u8 = nullptr;
+        diskann::load_bin<uint8_t>(query_path, xq_u8, nq, d);
+        float* xq = new float[nq * d];
+        for (size_t i = 0; i < nq * d; ++i) {
+            xq[i] = static_cast<float>(xq_u8[i]);
+        }
+        delete[] xq_u8;
+        return xq;
+    }
+    throw std::runtime_error("Unsupported query format: " + fmt);
+}
+
+uint8_t* load_query_as_u8(
+        const std::string& query_path,
+        const std::string& configured_format,
+        size_t& d,
+        size_t& nq) {
+    const std::string fmt = infer_vector_format(configured_format, query_path);
+    if (fmt == "u8bin") {
+        uint8_t* xq = nullptr;
+        diskann::load_bin<uint8_t>(query_path, xq, nq, d);
+        return xq;
+    }
+    if (fmt == "fvecs" || fmt == "fbin") {
+        float* xqf = nullptr;
+        if (fmt == "fvecs") {
+            xqf = fvecs_read(query_path.c_str(), &d, &nq);
+        } else {
+            diskann::load_bin<float>(query_path, xqf, nq, d);
+        }
+        if (!xqf) {
+            return nullptr;
+        }
+        uint8_t* xq = new uint8_t[nq * d];
+        for (size_t i = 0; i < nq * d; ++i) {
+            float v = xqf[i];
+            if (v < 0.0f) v = 0.0f;
+            if (v > 255.0f) v = 255.0f;
+            xq[i] = static_cast<uint8_t>(v);
+        }
+        delete[] xqf;
+        return xq;
+    }
+    throw std::runtime_error("Unsupported query format: " + fmt);
+}
+
+int* load_groundtruth_ids(
+        const std::string& gt_path,
+        const std::string& configured_format,
+        size_t& gt_k,
+        size_t expected_nq) {
+    const std::string fmt = infer_groundtruth_format(configured_format, gt_path);
+    size_t gt_nq = 0;
+
+    if (fmt == "ivecs") {
+        int* gt = ivecs_read(gt_path.c_str(), &gt_k, &gt_nq);
+        if (!gt) {
+            throw std::runtime_error("Failed to load ivecs groundtruth: " + gt_path);
+        }
+        if (gt_nq != expected_nq) {
+            throw std::runtime_error("Groundtruth nq mismatch with query count");
+        }
+        return gt;
+    }
+
+    if (fmt == "ibin") {
+        uint32_t* gt_u32 = nullptr;
+        diskann::load_bin<uint32_t>(gt_path, gt_u32, gt_nq, gt_k);
+        if (gt_nq != expected_nq) {
+            delete[] gt_u32;
+            throw std::runtime_error("Groundtruth nq mismatch with query count");
+        }
+        int* gt = new int[gt_nq * gt_k];
+        for (size_t i = 0; i < gt_nq * gt_k; ++i) {
+            if (gt_u32[i] > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+                delete[] gt_u32;
+                delete[] gt;
+                throw std::runtime_error("Groundtruth id exceeds int range");
+            }
+            gt[i] = static_cast<int>(gt_u32[i]);
+        }
+        delete[] gt_u32;
+        return gt;
+    }
+
+    if (fmt == "truthset") {
+        uint32_t* gt_ids = nullptr;
+        float* gt_dists = nullptr;
+        diskann::load_truthset(gt_path, gt_ids, gt_dists, gt_nq, gt_k);
+        if (gt_nq != expected_nq) {
+            delete[] gt_ids;
+            delete[] gt_dists;
+            throw std::runtime_error("Groundtruth nq mismatch with query count");
+        }
+        int* gt = new int[gt_nq * gt_k];
+        for (size_t i = 0; i < gt_nq * gt_k; ++i) {
+            if (gt_ids[i] > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+                delete[] gt_ids;
+                delete[] gt_dists;
+                delete[] gt;
+                throw std::runtime_error("Groundtruth id exceeds int range");
+            }
+            gt[i] = static_cast<int>(gt_ids[i]);
+        }
+        delete[] gt_ids;
+        delete[] gt_dists;
+        return gt;
+    }
+
+    throw std::runtime_error("Unsupported groundtruth format: " + fmt);
+}
+
+} // namespace
 
 /*****************************************************
  * Command line parsing
@@ -228,12 +398,34 @@ int main(int argc, char** argv) {
 
     // Load dataset
     std::cout << "\n[Loading data...]" << std::endl;
-    size_t d, nb, nq, gt_k;
-    float* xq = fvecs_read(ds_cfg.get_path(ds_cfg.query_file).c_str(), &d, &nq);
-    int* gt = ivecs_read(ds_cfg.get_path(ds_cfg.groundtruth_file).c_str(), &gt_k, &nq);
+    size_t d = 0, nq = 0, gt_k = 0;
+    float* xq_float = nullptr;
+    uint8_t* xq_u8 = nullptr;
+    int* gt = nullptr;
+    const std::string data_type = to_lower_copy(ds_cfg.data_type);
+    const bool use_uint8_index = (data_type == "uint8" || data_type == "u8");
+    const std::string query_path = ds_cfg.get_path(ds_cfg.query_file);
+    const std::string gt_path = ds_cfg.get_path(ds_cfg.groundtruth_file);
+    try {
+        if (use_uint8_index) {
+            xq_u8 = load_query_as_u8(query_path, ds_cfg.query_format, d, nq);
+        } else {
+            xq_float = load_query_as_float(query_path, ds_cfg.query_format, d, nq);
+        }
+        gt = load_groundtruth_ids(gt_path, ds_cfg.groundtruth_format, gt_k, nq);
+    } catch (const std::exception& e) {
+        std::cerr << "Error loading query/groundtruth files: " << e.what() << std::endl;
+        delete[] xq_float;
+        delete[] xq_u8;
+        delete[] gt;
+        return 1;
+    }
 
-    if (!xq || !gt) {
+    if (((use_uint8_index && !xq_u8) || (!use_uint8_index && !xq_float)) || !gt) {
         std::cerr << "Error: Failed to load query/groundtruth files" << std::endl;
+        delete[] xq_float;
+        delete[] xq_u8;
+        delete[] gt;
         return 1;
     }
 
@@ -245,94 +437,103 @@ int main(int argc, char** argv) {
     std::cout << "Index prefix: " << index_prefix << std::endl;
 
     std::shared_ptr<AlignedFileReader> reader(new LinuxAlignedFileReader());
-    std::unique_ptr<diskann::PQFlashIndex<float>> flash_index(
-        new diskann::PQFlashIndex<float>(reader, diskann::Metric::L2));
-
     Timer timer;
-    int load_result = flash_index->load(ds_cfg.threads, index_prefix.c_str());
-    if (load_result != 0) {
-        std::cerr << "Error loading DiskANN index: " << load_result << std::endl;
-        return load_result;
-    }
-    std::cout << "DiskANN index load time: " << timer.elapsed_ms() << " ms" << std::endl;
-
-    // Cache BFS levels for faster search
-    std::vector<uint32_t> node_list;
-    flash_index->cache_bfs_levels(ds_cfg.num_nodes_to_cache, node_list);
-    flash_index->load_cache_list(node_list);
-    std::cout << "Cached " << ds_cfg.num_nodes_to_cache << " nodes" << std::endl;
-
-    // Benchmark
     std::vector<BenchmarkResult> results;
     const size_t k = ds_cfg.k;
 
-    std::cout << "\n==================================================" << std::endl;
-    std::cout << "Standard DiskANN Search Results (Native PQ)" << std::endl;
-    std::cout << "==================================================" << std::endl;
-    std::cout << std::setw(8) << "L"
-              << std::setw(12) << "QPS"
-              << std::setw(12) << "Recall@" << k
-              << std::setw(12) << "Latency(ms)"
-              << std::setw(12) << "ndis_mean"
-              << std::setw(12) << "nhops_mean" << std::endl;
-    std::cout << std::string(68, '-') << std::endl;
-
-    for (uint32_t L : ds_cfg.L_search_values) {
-        if (L < k) continue;
-
-        std::vector<uint64_t> result_ids(nq * k);
-        std::vector<float> result_dists(nq * k);
-        std::vector<diskann::QueryStats> query_stats(nq);
-
-        // Warmup
-        size_t warmup_n = std::min((size_t)100, nq);
-        for (size_t i = 0; i < warmup_n; i++) {
-            flash_index->cached_beam_search(
-                xq + i * d, k, L,
-                result_ids.data() + i * k,
-                result_dists.data() + i * k,
-                ds_cfg.beam_width, false, nullptr);
+    auto run_with_index = [&](auto& flash_index, const auto* xq) -> int {
+        int load_result = flash_index->load(ds_cfg.threads, index_prefix.c_str());
+        if (load_result != 0) {
+            std::cerr << "Error loading DiskANN index: " << load_result << std::endl;
+            return load_result;
         }
+        std::cout << "DiskANN index load time: " << timer.elapsed_ms() << " ms" << std::endl;
 
-        // Reset stats
-        std::memset(query_stats.data(), 0, nq * sizeof(diskann::QueryStats));
+        // Cache BFS levels for faster search
+        std::vector<uint32_t> node_list;
+        flash_index->cache_bfs_levels(ds_cfg.num_nodes_to_cache, node_list);
+        flash_index->load_cache_list(node_list);
+        std::cout << "Cached " << ds_cfg.num_nodes_to_cache << " nodes" << std::endl;
 
-        // Timed search
-        timer.reset();
+        std::cout << "\n==================================================" << std::endl;
+        std::cout << "Standard DiskANN Search Results (Native PQ)" << std::endl;
+        std::cout << "==================================================" << std::endl;
+        std::cout << std::setw(8) << "L"
+                  << std::setw(12) << "QPS"
+                  << std::setw(12) << "Recall@" << k
+                  << std::setw(12) << "Latency(ms)"
+                  << std::setw(12) << "ndis_mean"
+                  << std::setw(12) << "nhops_mean" << std::endl;
+        std::cout << std::string(68, '-') << std::endl;
 
-        #pragma omp parallel for schedule(dynamic, 1)
-        for (int64_t i = 0; i < (int64_t)nq; i++) {
-            flash_index->cached_beam_search(
-                xq + i * d, k, L,
-                result_ids.data() + i * k,
-                result_dists.data() + i * k,
-                ds_cfg.beam_width, false, &query_stats[i]);
+        for (uint32_t L : ds_cfg.L_search_values) {
+            if (L < k) continue;
+
+            std::vector<uint64_t> result_ids(nq * k);
+            std::vector<float> result_dists(nq * k);
+            std::vector<diskann::QueryStats> query_stats(nq);
+
+            size_t warmup_n = std::min((size_t)100, nq);
+            for (size_t i = 0; i < warmup_n; i++) {
+                flash_index->cached_beam_search(
+                    xq + i * d, k, L,
+                    result_ids.data() + i * k,
+                    result_dists.data() + i * k,
+                    ds_cfg.beam_width, false, nullptr);
+            }
+
+            std::memset(query_stats.data(), 0, nq * sizeof(diskann::QueryStats));
+            timer.reset();
+
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int64_t i = 0; i < (int64_t)nq; i++) {
+                flash_index->cached_beam_search(
+                    xq + i * d, k, L,
+                    result_ids.data() + i * k,
+                    result_dists.data() + i * k,
+                    ds_cfg.beam_width, false, &query_stats[i]);
+            }
+
+            double search_time = timer.elapsed_ms();
+            double qps = nq * 1000.0 / search_time;
+            double latency = search_time / nq;
+            float recall = compute_recall_at_k_u64(nq, k, result_ids.data(), gt, gt_k);
+
+            std::vector<size_t> ndis_values(nq), nhop_values(nq);
+            for (size_t i = 0; i < nq; i++) {
+                ndis_values[i] = query_stats[i].n_cmps;
+                nhop_values[i] = query_stats[i].n_hops;
+            }
+            SearchStats ss;
+            ss.ndis_stats = compute_percentile_stats(ndis_values);
+            ss.nhops_stats = compute_percentile_stats(nhop_values);
+
+            results.push_back({L, qps, recall, latency, search_time, ss});
+
+            std::cout << std::setw(8) << L
+                      << std::setw(12) << std::fixed << std::setprecision(0) << qps
+                      << std::setw(12) << std::setprecision(4) << recall
+                      << std::setw(12) << std::setprecision(3) << latency
+                      << std::setw(12) << std::setprecision(1) << ss.ndis_stats.mean
+                      << std::setw(12) << std::setprecision(1) << ss.nhops_stats.mean
+                      << std::endl;
         }
+        return 0;
+    };
 
-        double search_time = timer.elapsed_ms();
-        double qps = nq * 1000.0 / search_time;
-        double latency = search_time / nq;
-        float recall = compute_recall_at_k_u64(nq, k, result_ids.data(), gt, gt_k);
-
-        // Aggregate ndis/nhop statistics
-        std::vector<size_t> ndis_values(nq), nhop_values(nq);
-        for (size_t i = 0; i < nq; i++) {
-            ndis_values[i] = query_stats[i].n_cmps;
-            nhop_values[i] = query_stats[i].n_hops;
-        }
-        SearchStats ss;
-        ss.ndis_stats = compute_percentile_stats(ndis_values);
-        ss.nhops_stats = compute_percentile_stats(nhop_values);
-
-        results.push_back({L, qps, recall, latency, search_time, ss});
-
-        std::cout << std::setw(8) << L
-                  << std::setw(12) << std::fixed << std::setprecision(0) << qps
-                  << std::setw(12) << std::setprecision(4) << recall
-                  << std::setw(12) << std::setprecision(3) << latency
-                  << std::setw(12) << std::setprecision(1) << ss.ndis_stats.mean
-                  << std::setw(12) << std::setprecision(1) << ss.nhops_stats.mean
-                  << std::endl;
+    int status = 0;
+    if (use_uint8_index) {
+        auto flash_index = std::make_unique<diskann::PQFlashIndex<uint8_t>>(reader, diskann::Metric::L2);
+        status = run_with_index(flash_index, xq_u8);
+    } else {
+        auto flash_index = std::make_unique<diskann::PQFlashIndex<float>>(reader, diskann::Metric::L2);
+        status = run_with_index(flash_index, xq_float);
+    }
+    if (status != 0) {
+        delete[] xq_float;
+        delete[] xq_u8;
+        delete[] gt;
+        return status;
     }
 
     // Save results to file
@@ -386,7 +587,8 @@ int main(int argc, char** argv) {
     std::cout << "\nTotal time: " << std::fixed << std::setprecision(1)
               << global_timer.elapsed_ms() / 1000.0 << " seconds" << std::endl;
 
-    delete[] xq;
+    delete[] xq_float;
+    delete[] xq_u8;
     delete[] gt;
 
     return 0;

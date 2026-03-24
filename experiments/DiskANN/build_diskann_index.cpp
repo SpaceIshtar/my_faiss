@@ -28,6 +28,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -161,6 +162,7 @@ int main(int argc, char** argv) {
     std::cout << "DiskANN Disk Index Builder" << std::endl;
     std::cout << "Dataset: " << opts.dataset << std::endl;
     std::cout << "Data path: " << ds_cfg.base_path << std::endl;
+    std::cout << "Data type: " << ds_cfg.data_type << std::endl;
     std::cout << "R (max degree): " << ds_cfg.diskann_R << std::endl;
     std::cout << "L (build complexity): " << ds_cfg.diskann_L_build << std::endl;
     std::cout << "Search DRAM budget: " << ds_cfg.search_dram_budget_gb << " GB" << std::endl;
@@ -196,19 +198,40 @@ int main(int argc, char** argv) {
     std::cout << "Parameters: " << params << std::endl;
     std::cout << "Index prefix: " << index_prefix << std::endl;
 
-    int result = diskann::build_disk_index<float>(
-        bin_path.c_str(),
-        index_prefix.c_str(),
-        params.c_str(),
-        diskann::Metric::L2,
-        false,  // use_opq
-        "",     // codebook_prefix
-        false,  // use_filters
-        "",     // label_file
-        "",     // universal_label
-        0,      // filter_threshold
-        0       // Lf
-    );
+    int result = -1;
+    std::string data_type_lower = ds_cfg.data_type;
+    for (char& c : data_type_lower) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (data_type_lower == "uint8" || data_type_lower == "u8") {
+        result = diskann::build_disk_index<uint8_t>(
+            bin_path.c_str(),
+            index_prefix.c_str(),
+            params.c_str(),
+            diskann::Metric::L2,
+            false,  // use_opq
+            "",     // codebook_prefix
+            false,  // use_filters
+            "",     // label_file
+            "",     // universal_label
+            0,      // filter_threshold
+            0       // Lf
+        );
+    } else {
+        result = diskann::build_disk_index<float>(
+            bin_path.c_str(),
+            index_prefix.c_str(),
+            params.c_str(),
+            diskann::Metric::L2,
+            false,  // use_opq
+            "",     // codebook_prefix
+            false,  // use_filters
+            "",     // label_file
+            "",     // universal_label
+            0,      // filter_threshold
+            0       // Lf
+        );
+    }
 
     if (result == 0) {
         std::cout << "\n==================================================" << std::endl;
