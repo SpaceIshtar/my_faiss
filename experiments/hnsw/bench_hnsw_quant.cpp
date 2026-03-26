@@ -253,6 +253,7 @@ void save_results_to_file(
         const std::string& dataset_name,
         const std::string& algorithm_name,
         const std::string& quant_params,
+        int num_threads,
         int hnsw_M,
         int hnsw_efConstruction,
         size_t nq,
@@ -281,6 +282,7 @@ void save_results_to_file(
         << "  Dataset:           " << dataset_name << "\n"
         << "  Algorithm:         " << algorithm_name << "\n"
         << "  Quant Params:      " << quant_params << "\n"
+        << "  Threads:           " << num_threads << "\n"
         << "  HNSW M:            " << hnsw_M << "\n"
         << "  HNSW efConstruct:  " << hnsw_efConstruction << "\n"
         << "  Num Queries:       " << nq << "\n"
@@ -333,11 +335,18 @@ void save_results_to_file(
 std::string generate_result_filename(
         const std::string& algorithm,
         const std::string& quant_params,
+        int num_threads,
         int hnsw_M,
-        int hnsw_efConstruction) {
+        int hnsw_efConstruction,
+        const std::string& result_tag = "") {
     std::ostringstream oss;
     oss << algorithm << "_" << quant_params
-        << "_M" << hnsw_M << "_efc" << hnsw_efConstruction << ".txt";
+        << "_t" << num_threads
+        << "_M" << hnsw_M << "_efc" << hnsw_efConstruction;
+    if (!result_tag.empty()) {
+        oss << "_" << result_tag;
+    }
+    oss << ".txt";
     return oss.str();
 }
 
@@ -387,11 +396,23 @@ struct Options {
     std::string algorithm = "sq";
     std::string config_dir = "./config";
     std::string data_path;  // Override
+    std::string result_tag;
     int threads = -1;       // -1 means use config
+    int saq_cluster_cache = -1;  // -1 means use wrapper default
     std::vector<size_t> ef_values;  // Empty means use config
     double timeout_sec = 3600.0;    // Train+add timeout in seconds (default: 1 hour)
     bool help = false;
 };
+
+int parse_cli_bool(const std::string& value) {
+    if (value == "1" || value == "true" || value == "TRUE" || value == "on" || value == "yes") {
+        return 1;
+    }
+    if (value == "0" || value == "false" || value == "FALSE" || value == "off" || value == "no") {
+        return 0;
+    }
+    throw std::invalid_argument("Expected boolean value, got: " + value);
+}
 
 void print_usage(const char* prog) {
     std::cout << "Usage: " << prog << " --dataset <name> --algorithm <name> [options]\n\n"
@@ -401,6 +422,8 @@ void print_usage(const char* prog) {
               << "  --config-dir <path>    Config directory (default: ./config)\n"
               << "  --data-path <path>     Override dataset base path\n"
               << "  --threads <n>          Number of threads\n"
+              << "  --result-tag <tag>     Extra suffix for result filename\n"
+              << "  --saq-cluster-cache <bool>  Enable SAQ per-query cluster cache\n"
               << "  --ef <list>            Comma-separated ef values to test\n"
               << "  --timeout <seconds>    Train+add timeout per param set (default: 3600)\n"
               << "  --help                 Show this help\n\n"
@@ -426,6 +449,10 @@ Options parse_args(int argc, char** argv) {
             opts.data_path = argv[++i];
         } else if (arg == "--threads" && i + 1 < argc) {
             opts.threads = std::stoi(argv[++i]);
+        } else if (arg == "--result-tag" && i + 1 < argc) {
+            opts.result_tag = argv[++i];
+        } else if (arg == "--saq-cluster-cache" && i + 1 < argc) {
+            opts.saq_cluster_cache = parse_cli_bool(argv[++i]);
         } else if (arg == "--ef" && i + 1 < argc) {
             std::string ef_str = argv[++i];
             std::istringstream iss(ef_str);
@@ -590,8 +617,12 @@ int main(int argc, char** argv) {
         std::cout << "==================================================" << std::endl;
 
         // Create wrapper and generate save path
+        auto wrapper_params = ps.params;
+        if (opts.algorithm == "saq" && opts.saq_cluster_cache != -1) {
+            wrapper_params["cluster_cache"] = opts.saq_cluster_cache ? "true" : "false";
+        }
         std::shared_ptr<QuantWrapper> quant(
-            create_wrapper(opts.algorithm, d, faiss::METRIC_L2, ps.params).release());
+            create_wrapper(opts.algorithm, d, faiss::METRIC_L2, wrapper_params).release());
         std::string quant_params_str = quant->get_params_string();
         std::string quant_save_path = get_quant_index_path(
             ds_cfg.base_path, opts.algorithm, quant_params_str);
@@ -668,12 +699,13 @@ int main(int argc, char** argv) {
 
         // Save results to file
         std::string result_filename = generate_result_filename(
-            opts.algorithm, quant_params_str, ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction);
+            opts.algorithm, quant_params_str, ds_cfg.threads,
+            ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction, opts.result_tag);
         std::string result_dir = "experiments/hnsw/results/" + opts.dataset + "/" + opts.algorithm;
         std::string result_path = result_dir + "/" + result_filename;
 
         save_results_to_file(
-            result_path, opts.dataset, opts.algorithm, quant_params_str,
+            result_path, opts.dataset, opts.algorithm, quant_params_str, ds_cfg.threads,
             ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction,
             nq, ds_cfg.k, results);
     }
