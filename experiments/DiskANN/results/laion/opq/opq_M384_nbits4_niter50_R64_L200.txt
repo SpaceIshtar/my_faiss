@@ -15,24 +15,24 @@ DiskANN + Quantization Benchmark Results
 [Summary]
        L         QPS      Recall Latency(ms)   ndis_mean  nhops_mean
 --------------------------------------------------------------------
-      10        4836      0.7758       0.207      2743.4         7.3
-      20        4739      0.8972       0.211      3464.5         9.3
-      30        3925      0.9274       0.255      4199.0        11.6
-      50        2887      0.9463       0.346      5687.0        16.3
-      70        2259      0.9546       0.443      7179.7        21.2
-     100        1695      0.9598       0.590      9388.9        28.3
-     150        1199      0.9638       0.834     13014.6        40.8
-     200         929      0.9658       1.076     16595.2        53.0
-     300         639      0.9682       1.565     23635.1        77.8
-     400         487      0.9692       2.051     30552.5       102.6
+      10        4726      0.7758       0.212      2743.4         7.3
+      20        4640      0.8972       0.216      3464.5         9.3
+      30        3836      0.9274       0.261      4199.0        11.6
+      50        2789      0.9463       0.359      5687.0        16.3
+      70        2196      0.9546       0.455      7179.7        21.2
+     100        1655      0.9598       0.604      9388.9        28.3
+     150        1171      0.9638       0.854     13014.6        40.8
+     200         907      0.9658       1.102     16595.2        53.0
+     300         625      0.9682       1.599     23635.1        77.8
+     400         477      0.9692       2.098     30552.5       102.6
 
 [Detailed Statistics]
 
 --- L = 10 ---
-  QPS:          4835.66
+  QPS:          4725.52
   Recall@10:    0.7758
-  Total Time:   2067.97 ms
-  Avg Latency:  0.2068 ms
+  Total Time:   2116.17 ms
+  Avg Latency:  0.2116 ms
   ndis (distance computations):
     min:      759.00
     p10:      1970.00
@@ -57,10 +57,10 @@ DiskANN + Quantization Benchmark Results
     stddev:   1.62
 
 --- L = 20 ---
-  QPS:          4739.21
+  QPS:          4639.64
   Recall@10:    0.8972
-  Total Time:   2110.06 ms
-  Avg Latency:  0.2110 ms
+  Total Time:   2155.34 ms
+  Avg Latency:  0.2155 ms
   ndis (distance computations):
     min:      959.00
     p10:      2583.90
@@ -85,10 +85,10 @@ DiskANN + Quantization Benchmark Results
     stddev:   1.65
 
 --- L = 30 ---
-  QPS:          3924.56
+  QPS:          3835.52
   Recall@10:    0.9274
-  Total Time:   2548.06 ms
-  Avg Latency:  0.2548 ms
+  Total Time:   2607.21 ms
+  Avg Latency:  0.2607 ms
   ndis (distance computations):
     min:      1068.00
     p10:      3187.00
@@ -113,10 +113,10 @@ DiskANN + Quantization Benchmark Results
     stddev:   1.64
 
 --- L = 50 ---
-  QPS:          2886.53
+  QPS:          2788.60
   Recall@10:    0.9463
-  Total Time:   3464.37 ms
-  Avg Latency:  0.3464 ms
+  Total Time:   3586.03 ms
+  Avg Latency:  0.3586 ms
   ndis (distance computations):
     min:      1274.00
     p10:      4379.00
@@ -141,10 +141,10 @@ DiskANN + Quantization Benchmark Results
     stddev:   1.57
 
 --- L = 70 ---
-  QPS:          2259.12
+  QPS:          2196.42
   Recall@10:    0.9546
-  Total Time:   4426.49 ms
-  Avg Latency:  0.4426 ms
+  Total Time:   4552.87 ms
+  Avg Latency:  0.4553 ms
   ndis (distance computations):
     min:      1647.00
     p10:      5553.90
@@ -169,10 +169,10 @@ DiskANN + Quantization Benchmark Results
     stddev:   1.60
 
 --- L = 100 ---
-  QPS:          1694.75
+  QPS:          1654.58
   Recall@10:    0.9598
-  Total Time:   5900.59 ms
-  Avg Latency:  0.5901 ms
+  Total Time:   6043.84 ms
+  Avg Latency:  0.6044 ms
   ndis (distance computations):
     min:      2049.00
     p10:      7286.90
@@ -197,10 +197,10 @@ DiskANN + Quantization Benchmark Results
     stddev:   1.65
 
 --- L = 150 ---
-  QPS:          1198.65
+  QPS:          1170.59
   Recall@10:    0.9638
-  Total Time:   8342.75 ms
-  Avg Latency:  0.8343 ms
+  Total Time:   8542.68 ms
+  Avg Latency:  0.8543 ms
   ndis (distance computations):
     min:      3259.00
     p10:      10086.00
@@ -225,10 +225,10 @@ DiskANN + Quantization Benchmark Results
     stddev:   1.58
 
 --- L = 200 ---
-  QPS:          929.14
+  QPS:          907.18
   Recall@10:    0.9658
-  Total Time:   10762.69 ms
-  Avg Latency:  1.0763 ms
+  Total Time:   11023.23 ms
+  Avg Latency:  1.1023 ms
   ndis (distance computations):
     min:      4185.00
     p10:      12852.00
@@ -253,10 +253,10 @@ DiskANN + Quantization Benchmark Results
     stddev:   1.60
 
 --- L = 300 ---
-  QPS:          639.17
+  QPS:          625.26
   Recall@10:    0.9682
-  Total Time:   15645.26 ms
-  Avg Latency:  1.5645 ms
+  Total Time:   15993.45 ms
+  Avg Latency:  1.5993 ms
   ndis (distance computations):
     min:      6113.00
     p10:      18288.90
@@ -281,10 +281,10 @@ DiskANN + Quantization Benchmark Results
     stddev:   1.72
 
 --- L = 400 ---
-  QPS:          487.46
+  QPS:          476.61
   Recall@10:    0.9692
-  Total Time:   20514.63 ms
-  Avg Latency:  2.0515 ms
+  Total Time:   20981.42 ms
+  Avg Latency:  2.0981 ms
   ndis (distance computations):
     min:      7838.00
     p10:      23658.80
