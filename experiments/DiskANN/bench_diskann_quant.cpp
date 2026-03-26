@@ -806,12 +806,15 @@ int main(int argc, char** argv) {
             std::cout << "==================================================" << std::endl;
 
             // Create quantizer wrapper
-            auto quant = create_wrapper(opts.algorithm, d, faiss::METRIC_L2, ps.params);
+            auto quant_config_params = ps.params;
+            quant_config_params["threads"] = std::to_string(ds_cfg.threads);
+            auto quant = create_wrapper(opts.algorithm, d, faiss::METRIC_L2, quant_config_params);
 
             // Train and add vectors
             std::cout << "[Training " << quant->get_name() << "...]" << std::endl;
             timer.reset();
             if (base_fmt == "u8bin") {
+                Timer train_timer;
                 size_t train_n = ds_cfg.sample_num > 0 ? std::min(ds_cfg.sample_num, nb) : 0;
                 if (train_n == 0) {
                     train_n = std::min<size_t>(nb, 200000);
@@ -837,14 +840,21 @@ int main(int argc, char** argv) {
                     sample_f[i] = static_cast<float>(sample_u8[i]);
                 }
                 quant->train(train_n, sample_f.data());
+                std::cout << "u8bin train done: " << train_n
+                          << " vectors, elapsed " << train_timer.elapsed_ms()
+                          << " ms" << std::endl;
 
                 const size_t batch_size = std::max<size_t>(1, ds_cfg.add_batch_size);
+                const size_t total_batches = (nb + batch_size - 1) / batch_size;
                 std::vector<uint8_t> batch_u8(batch_size * d);
                 std::vector<float> batch_f(batch_size * d);
                 base_ifs.clear();
                 base_ifs.seekg(2 * sizeof(int32_t), std::ios::beg);
 
                 size_t added = 0;
+                size_t batch_id = 0;
+                size_t next_progress_percent = 1;
+                Timer add_timer;
                 while (added < nb) {
                     const size_t cur = std::min(batch_size, nb - added);
                     const size_t cur_bytes = cur * d;
@@ -858,6 +868,23 @@ int main(int argc, char** argv) {
                     }
                     quant->add(cur, batch_f.data());
                     added += cur;
+                    batch_id++;
+                    const double progress = nb == 0
+                        ? 100.0
+                        : 100.0 * static_cast<double>(added) / static_cast<double>(nb);
+                    const size_t progress_percent = nb == 0
+                        ? 100
+                        : (added * 100) / nb;
+                    if (progress_percent >= next_progress_percent || added == nb) {
+                        std::cout << "u8bin add progress: batch " << batch_id
+                                  << "/" << total_batches
+                                  << ", added " << added << "/" << nb
+                                  << " vectors (" << std::fixed << std::setprecision(1)
+                                  << progress << "%), elapsed "
+                                  << add_timer.elapsed_ms() << " ms"
+                                  << std::defaultfloat << std::endl;
+                        next_progress_percent = std::min<size_t>(101, progress_percent + 1);
+                    }
                 }
             } else if (base_fmt == "fbin") {
                 size_t train_n = ds_cfg.sample_num > 0 ? std::min(ds_cfg.sample_num, nb) : 0;

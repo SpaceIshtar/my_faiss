@@ -170,7 +170,10 @@ target_include_directories(bench_diskann_quant PRIVATE
     ${VAQ_EIGEN_DIR}
 )
 target_compile_definitions(bench_diskann_quant PRIVATE ${DISKANN_COMPILE_DEFS} VAQ_OPTIMIZE EIGEN_DONT_PARALLELIZE)
-target_compile_options(bench_diskann_quant PRIVATE -fopenmp ${DISKANN_COMPILE_OPTS} -include xmmintrin.h -mavx2 -mfma)
+# Keep the benchmark on the host's full ISA. Adding explicit -mavx2 here can
+# downgrade OSQ source files and disable AVX-512 / VPOPCNT paths even though
+# the machine and linked Faiss variant support them.
+target_compile_options(bench_diskann_quant PRIVATE -fopenmp ${DISKANN_COMPILE_OPTS} -include xmmintrin.h)
 target_link_libraries(bench_diskann_quant PRIVATE
     faiss_avx512
     -lglpk -larmadillo

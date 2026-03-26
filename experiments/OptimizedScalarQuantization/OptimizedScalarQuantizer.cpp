@@ -81,6 +81,9 @@ size_t EncodingConfig::discrete_dims(ScalarEncoding encoding, size_t dims) {
 size_t EncodingConfig::doc_packed_len(ScalarEncoding encoding, size_t dims) {
   const size_t dd = discrete_dims(encoding, dims);
   switch (encoding) {
+    case ScalarEncoding::SEVEN_BIT:
+      // Legacy OSQ stores 7-bit values one per byte instead of bit-packing.
+      return dd;
     case ScalarEncoding::DIBIT_QUERY_NIBBLE:
       return 2 * ((dd + 7) / 8);
     default: {

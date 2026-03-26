@@ -1,0 +1,342 @@
+========================================
+DiskANN + Quantization Benchmark Results
+========================================
+
+[Configuration]
+  Dataset:           bigann
+  Algorithm:         opq
+  Quant Params:      M16_nbits8_niter50
+  DiskANN R:         64
+  DiskANN L_build:   200
+  Beam Width:        4
+  Num Queries:       10000
+  Recall@k:          10
+
+[Summary]
+       L         QPS      Recall Latency(ms)   ndis_mean  nhops_mean
+--------------------------------------------------------------------
+      10        8009      0.3581       0.125      3827.9         9.3
+      20        8527      0.4832       0.117      4888.8        11.7
+      30        7103      0.5600       0.141      5841.5        14.1
+      50        5458      0.6593       0.183      7713.9        18.6
+      70        4419      0.7235       0.226      9590.2        23.3
+     100        3368      0.7865       0.297     12425.3        30.4
+     150        2432      0.8476       0.411     17144.0        42.5
+     200        1901      0.8839       0.526     21858.5        54.8
+     300        1315      0.9234       0.760     31180.8        79.4
+     400         999      0.9448       1.001     40392.3       104.2
+     500         804      0.9575       1.243     49505.9       129.1
+
+[Detailed Statistics]
+
+--- L = 10 ---
+  QPS:          8009.35
+  Recall@10:    0.3581
+  Total Time:   1248.54 ms
+  Avg Latency:  0.1249 ms
+  ndis (distance computations):
+    min:      1561.00
+    p10:      3039.00
+    p25:      3386.00
+    p50:      3806.00
+    p75:      4225.00
+    p90:      4671.00
+    max:      7416.00
+    mean:     3827.88
+    variance: 420776.47
+    stddev:   648.67
+  nhops (graph hops):
+    min:      4.00
+    p10:      7.00
+    p25:      8.00
+    p50:      9.00
+    p75:      10.00
+    p90:      12.00
+    max:      21.00
+    mean:     9.29
+    variance: 3.29
+    stddev:   1.81
+
+--- L = 20 ---
+  QPS:          8527.21
+  Recall@10:    0.4832
+  Total Time:   1172.72 ms
+  Avg Latency:  0.1173 ms
+  ndis (distance computations):
+    min:      2456.00
+    p10:      3938.90
+    p25:      4353.00
+    p50:      4830.50
+    p75:      5351.00
+    p90:      5929.10
+    max:      8652.00
+    mean:     4888.78
+    variance: 636656.64
+    stddev:   797.91
+  nhops (graph hops):
+    min:      7.00
+    p10:      10.00
+    p25:      10.00
+    p50:      11.00
+    p75:      13.00
+    p90:      14.00
+    max:      23.00
+    mean:     11.75
+    variance: 3.88
+    stddev:   1.97
+
+--- L = 30 ---
+  QPS:          7102.62
+  Recall@10:    0.5600
+  Total Time:   1407.93 ms
+  Avg Latency:  0.1408 ms
+  ndis (distance computations):
+    min:      2874.00
+    p10:      4741.00
+    p25:      5227.75
+    p50:      5769.00
+    p75:      6375.00
+    p90:      7017.20
+    max:      10063.00
+    mean:     5841.51
+    variance: 841769.00
+    stddev:   917.48
+  nhops (graph hops):
+    min:      9.00
+    p10:      12.00
+    p25:      13.00
+    p50:      14.00
+    p75:      15.00
+    p90:      17.00
+    max:      27.00
+    mean:     14.05
+    variance: 4.17
+    stddev:   2.04
+
+--- L = 50 ---
+  QPS:          5457.58
+  Recall@10:    0.6593
+  Total Time:   1832.31 ms
+  Avg Latency:  0.1832 ms
+  ndis (distance computations):
+    min:      3525.00
+    p10:      6295.90
+    p25:      6992.75
+    p50:      7695.00
+    p75:      8364.00
+    p90:      9083.10
+    max:      14768.00
+    mean:     7713.91
+    variance: 1251837.59
+    stddev:   1118.86
+  nhops (graph hops):
+    min:      14.00
+    p10:      17.00
+    p25:      17.00
+    p50:      18.00
+    p75:      20.00
+    p90:      21.00
+    max:      33.00
+    mean:     18.61
+    variance: 4.18
+    stddev:   2.05
+
+--- L = 70 ---
+  QPS:          4418.53
+  Recall@10:    0.7235
+  Total Time:   2263.20 ms
+  Avg Latency:  0.2263 ms
+  ndis (distance computations):
+    min:      4281.00
+    p10:      7818.00
+    p25:      8726.00
+    p50:      9660.00
+    p75:      10412.00
+    p90:      11147.20
+    max:      16505.00
+    mean:     9590.20
+    variance: 1745750.93
+    stddev:   1321.27
+  nhops (graph hops):
+    min:      19.00
+    p10:      21.00
+    p25:      22.00
+    p50:      23.00
+    p75:      24.00
+    p90:      26.00
+    max:      39.00
+    mean:     23.28
+    variance: 3.85
+    stddev:   1.96
+
+--- L = 100 ---
+  QPS:          3368.27
+  Recall@10:    0.7865
+  Total Time:   2968.89 ms
+  Avg Latency:  0.2969 ms
+  ndis (distance computations):
+    min:      5208.00
+    p10:      10059.00
+    p25:      11355.00
+    p50:      12629.00
+    p75:      13557.00
+    p90:      14331.20
+    max:      20508.00
+    mean:     12425.26
+    variance: 2737160.79
+    stddev:   1654.44
+  nhops (graph hops):
+    min:      26.00
+    p10:      29.00
+    p25:      29.00
+    p50:      30.00
+    p75:      31.00
+    p90:      33.00
+    max:      45.00
+    mean:     30.40
+    variance: 3.28
+    stddev:   1.81
+
+--- L = 150 ---
+  QPS:          2432.30
+  Recall@10:    0.8476
+  Total Time:   4111.33 ms
+  Avg Latency:  0.4111 ms
+  ndis (distance computations):
+    min:      6756.00
+    p10:      13750.70
+    p25:      15666.75
+    p50:      17533.50
+    p75:      18817.00
+    p90:      19748.10
+    max:      25250.00
+    mean:     17144.05
+    variance: 5246452.60
+    stddev:   2290.51
+  nhops (graph hops):
+    min:      39.00
+    p10:      41.00
+    p25:      42.00
+    p50:      42.00
+    p75:      43.00
+    p90:      44.00
+    max:      57.00
+    mean:     42.53
+    variance: 2.60
+    stddev:   1.61
+
+--- L = 200 ---
+  QPS:          1901.17
+  Recall@10:    0.8839
+  Total Time:   5259.92 ms
+  Avg Latency:  0.5260 ms
+  ndis (distance computations):
+    min:      8392.00
+    p10:      17387.60
+    p25:      19919.25
+    p50:      22426.00
+    p75:      24104.00
+    p90:      25241.30
+    max:      30796.00
+    mean:     21858.47
+    variance: 8865024.00
+    stddev:   2977.42
+  nhops (graph hops):
+    min:      51.00
+    p10:      53.00
+    p25:      54.00
+    p50:      55.00
+    p75:      55.00
+    p90:      57.00
+    max:      70.00
+    mean:     54.76
+    variance: 2.43
+    stddev:   1.56
+
+--- L = 300 ---
+  QPS:          1315.05
+  Recall@10:    0.9234
+  Total Time:   7604.26 ms
+  Avg Latency:  0.7604 ms
+  ndis (distance computations):
+    min:      11565.00
+    p10:      24528.70
+    p25:      28300.00
+    p50:      32024.50
+    p75:      34570.00
+    p90:      36200.10
+    max:      45664.00
+    mean:     31180.80
+    variance: 19259759.32
+    stddev:   4388.59
+  nhops (graph hops):
+    min:      75.00
+    p10:      78.00
+    p25:      79.00
+    p50:      79.00
+    p75:      80.00
+    p90:      81.00
+    max:      97.00
+    mean:     79.45
+    variance: 2.07
+    stddev:   1.44
+
+--- L = 400 ---
+  QPS:          998.89
+  Recall@10:    0.9448
+  Total Time:   10011.13 ms
+  Avg Latency:  1.0011 ms
+  ndis (distance computations):
+    min:      15027.00
+    p10:      31610.20
+    p25:      36571.75
+    p50:      41531.00
+    p75:      44909.00
+    p90:      47072.20
+    max:      55295.00
+    mean:     40392.25
+    variance: 33945294.43
+    stddev:   5826.26
+  nhops (graph hops):
+    min:      100.00
+    p10:      103.00
+    p25:      103.00
+    p50:      104.00
+    p75:      105.00
+    p90:      106.00
+    max:      119.00
+    mean:     104.23
+    variance: 1.82
+    stddev:   1.35
+
+--- L = 500 ---
+  QPS:          804.30
+  Recall@10:    0.9575
+  Total Time:   12433.10 ms
+  Avg Latency:  1.2433 ms
+  ndis (distance computations):
+    min:      18285.00
+    p10:      38569.80
+    p25:      44679.75
+    p50:      50906.50
+    p75:      55178.25
+    p90:      57906.20
+    max:      63955.00
+    mean:     49505.88
+    variance: 52890674.90
+    stddev:   7272.60
+  nhops (graph hops):
+    min:      125.00
+    p10:      128.00
+    p25:      128.00
+    p50:      129.00
+    p75:      130.00
+    p90:      131.00
+    max:      139.00
+    mean:     129.08
+    variance: 1.64
+    stddev:   1.28
+
+========================================
+End of Results
+========================================

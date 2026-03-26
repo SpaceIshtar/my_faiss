@@ -40,6 +40,26 @@ public:
         return 1.0f - index_->score(*query_, i);
     }
 
+    void distances_batch_4(
+            const faiss::idx_t idx0,
+            const faiss::idx_t idx1,
+            const faiss::idx_t idx2,
+            const faiss::idx_t idx3,
+            float& dis0,
+            float& dis1,
+            float& dis2,
+            float& dis3) override {
+        if (!query_.has_value()) {
+            throw std::runtime_error("OSQDistanceComputer query is not set");
+        }
+        float s0, s1, s2, s3;
+        index_->score_batch_4(*query_, idx0, idx1, idx2, idx3, s0, s1, s2, s3);
+        dis0 = 1.0f - s0;
+        dis1 = 1.0f - s1;
+        dis2 = 1.0f - s2;
+        dis3 = 1.0f - s3;
+    }
+
     float symmetric_dis(faiss::idx_t i, faiss::idx_t j) override {
         if (i == j) {
             return 0.0f;

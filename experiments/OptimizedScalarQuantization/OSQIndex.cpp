@@ -118,10 +118,14 @@ void parallel_for(size_t begin, size_t end, int num_threads, Fn fn) {
 
 OSQIndex::OSQIndex(size_t dims, Similarity similarity, ScalarEncoding encoding)
     : dims_(dims),
+      discrete_dims_(EncodingConfig::discrete_dims(encoding, dims)),
+      doc_packed_len_(EncodingConfig::doc_packed_len(encoding, dims)),
       similarity_(similarity),
       encoding_(encoding),
       trained_(false),
       num_threads_(std::max(1u, std::thread::hardware_concurrency())),
+      query_scale_(scale_lut(EncodingConfig::query_bits(encoding))),
+      doc_scale_(scale_lut(EncodingConfig::doc_bits(encoding))),
       centroid_(dims, 0.0f),
       centroid_dp_(0.0f),
       quantizer_(similarity) {}
@@ -180,13 +184,12 @@ void OSQIndex::train(size_t n, const float* x) {
 }
 
 EncodedVector OSQIndex::encode_doc(const float* x) const {
-  const size_t dd = EncodingConfig::discrete_dims(encoding_, dims_);
   const uint8_t dbits = EncodingConfig::doc_bits(encoding_);
 
   std::vector<float> v(x, x + dims_);
   if (similarity_ == Similarity::COSINE) l2_normalize(v);
 
-  std::vector<uint8_t> scratch(dd, 0);
+  std::vector<uint8_t> scratch(discrete_dims_, 0);
   const QuantizationResult corr =
       quantizer_.scalar_quantize(v.data(), dims_, dbits, centroid_.data(), scratch.data());
 
@@ -200,20 +203,22 @@ EncodedVector OSQIndex::encode_doc(const float* x) const {
       break;
     case ScalarEncoding::PACKED_NIBBLE: {
       out.packed.resize(EncodingConfig::doc_packed_len(encoding_, dims_), 0);
-      for (size_t i = 0; i < dd; i += 2) {
+      for (size_t i = 0; i < discrete_dims_; i += 2) {
         const uint8_t lo = scratch[i] & 0x0F;
-        const uint8_t hi = (i + 1 < dd) ? (scratch[i + 1] & 0x0F) : 0;
+        const uint8_t hi = (i + 1 < discrete_dims_) ? (scratch[i + 1] & 0x0F) : 0;
         out.packed[i / 2] = static_cast<uint8_t>(lo | (hi << 4));
       }
       break;
     }
     case ScalarEncoding::SINGLE_BIT_QUERY_NIBBLE:
       out.packed.resize(EncodingConfig::doc_packed_len(encoding_, dims_), 0);
-      OptimizedScalarQuantizer::pack_as_binary(scratch.data(), dd, out.packed.data());
+      OptimizedScalarQuantizer::pack_as_binary(
+          scratch.data(), discrete_dims_, out.packed.data());
       break;
     case ScalarEncoding::DIBIT_QUERY_NIBBLE:
       out.packed.resize(EncodingConfig::doc_packed_len(encoding_, dims_), 0);
-      OptimizedScalarQuantizer::transpose_dibit(scratch.data(), dd, out.packed.data());
+      OptimizedScalarQuantizer::transpose_dibit(
+          scratch.data(), discrete_dims_, out.packed.data());
       break;
   }
 
@@ -221,18 +226,21 @@ EncodedVector OSQIndex::encode_doc(const float* x) const {
 }
 
 OSQIndex::EncodedQuery OSQIndex::encode_query(const float* q) const {
-  const size_t dd = EncodingConfig::discrete_dims(encoding_, dims_);
   const uint8_t qbits = EncodingConfig::query_bits(encoding_);
 
   std::vector<float> v(q, q + dims_);
   if (similarity_ == Similarity::COSINE) l2_normalize(v);
 
-  std::vector<uint8_t> scratch(dd, 0);
+  std::vector<uint8_t> scratch(discrete_dims_, 0);
   QuantizationResult corr =
       quantizer_.scalar_quantize(v.data(), dims_, qbits, centroid_.data(), scratch.data());
 
   EncodedQuery out;
   out.corr = corr;
+  out.ay = corr.lower_interval;
+  out.ly = (corr.upper_interval - corr.lower_interval) * query_scale_;
+  out.sy = static_cast<float>(corr.quantized_component_sum);
+  out.additional_correction = corr.additional_correction;
 
   if (!EncodingConfig::is_asymmetric(encoding_)) {
     out.q.assign(scratch.begin(), scratch.end());
@@ -240,7 +248,8 @@ OSQIndex::EncodedQuery OSQIndex::encode_query(const float* q) const {
   }
 
   out.q.resize(EncodingConfig::query_packed_len(encoding_, dims_), 0);
-  OptimizedScalarQuantizer::transpose_half_byte(scratch.data(), dd, out.q.data());
+  OptimizedScalarQuantizer::transpose_half_byte(
+      scratch.data(), discrete_dims_, out.q.data());
   return out;
 }
 
@@ -284,6 +293,36 @@ int OSQIndex::dot_uint8(const uint8_t* a, const uint8_t* b, size_t n) {
 }
 
 int OSQIndex::dot_int4_with_packed_doc(const uint8_t* q, const uint8_t* packed_doc, size_t dims) {
+#if defined(__AVX2__)
+  size_t i = 0;
+  __m256i acc = _mm256_setzero_si256();
+  const __m128i nibble_mask = _mm_set1_epi8(0x0F);
+  const __m256i ones = _mm256_set1_epi16(1);
+
+  for (; i + 16 <= dims; i += 16) {
+    const __m128i packed = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(packed_doc + i / 2));
+    const __m128i lo = _mm_and_si128(packed, nibble_mask);
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), nibble_mask);
+    const __m128i unpacked = _mm_unpacklo_epi8(lo, hi);
+    const __m128i q16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q + i));
+
+    const __m256i q16_wide = _mm256_cvtepu8_epi16(q16);
+    const __m256i d16_wide = _mm256_cvtepu8_epi16(unpacked);
+    const __m256i prod = _mm256_mullo_epi16(q16_wide, d16_wide);
+    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(prod, ones));
+  }
+
+  alignas(32) int32_t lanes[8];
+  _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), acc);
+  int s = lanes[0] + lanes[1] + lanes[2] + lanes[3] +
+          lanes[4] + lanes[5] + lanes[6] + lanes[7];
+  for (; i < dims; ++i) {
+    const uint8_t p = packed_doc[i / 2];
+    const uint8_t d = (i % 2 == 0) ? (p & 0x0F) : ((p >> 4) & 0x0F);
+    s += static_cast<int>(q[i]) * static_cast<int>(d);
+  }
+  return s;
+#else
   int s = 0;
   for (size_t i = 0; i < dims; ++i) {
     const uint8_t p = packed_doc[i / 2];
@@ -291,6 +330,7 @@ int OSQIndex::dot_int4_with_packed_doc(const uint8_t* q, const uint8_t* packed_d
     s += static_cast<int>(q[i]) * static_cast<int>(d);
   }
   return s;
+#endif
 }
 
 int OSQIndex::dot_int4_with_binary_doc_transposed(
@@ -320,48 +360,54 @@ int OSQIndex::dot_int4_with_dibit_doc_transposed(
   return low_score + 2 * high_score;
 }
 
-float OSQIndex::score_query_doc(const EncodedQuery& q, const EncodedVector& x) const {
-  const size_t dd = EncodingConfig::discrete_dims(encoding_, dims_);
+const uint8_t* OSQIndex::doc_packed_ptr(size_t idx) const {
+  return packed_codes_.data() + idx * doc_packed_len_;
+}
 
+const QuantizationResult& OSQIndex::doc_correction(size_t idx) const {
+  return corrections_[idx];
+}
+
+float OSQIndex::score_query_doc(
+    const EncodedQuery& q,
+    const uint8_t* packed,
+    const QuantizationResult& correction) const {
   float qc_dist = 0.0f;
   switch (encoding_) {
     case ScalarEncoding::UNSIGNED_BYTE:
     case ScalarEncoding::SEVEN_BIT:
-      qc_dist = static_cast<float>(dot_uint8(q.q.data(), x.packed.data(), dd));
+      qc_dist = static_cast<float>(dot_uint8(q.q.data(), packed, discrete_dims_));
       break;
     case ScalarEncoding::PACKED_NIBBLE:
-      qc_dist = static_cast<float>(dot_int4_with_packed_doc(q.q.data(), x.packed.data(), dd));
+      qc_dist = static_cast<float>(dot_int4_with_packed_doc(q.q.data(), packed, discrete_dims_));
       break;
     case ScalarEncoding::SINGLE_BIT_QUERY_NIBBLE:
-      qc_dist =
-          static_cast<float>(dot_int4_with_binary_doc_transposed(q.q.data(), x.packed.data(), dd));
+      qc_dist = static_cast<float>(
+          dot_int4_with_binary_doc_transposed(q.q.data(), packed, discrete_dims_));
       break;
     case ScalarEncoding::DIBIT_QUERY_NIBBLE:
-      qc_dist =
-          static_cast<float>(dot_int4_with_dibit_doc_transposed(q.q.data(), x.packed.data(), dd));
+      qc_dist = static_cast<float>(
+          dot_int4_with_dibit_doc_transposed(q.q.data(), packed, discrete_dims_));
       break;
   }
 
-  const float qscale = scale_lut(EncodingConfig::query_bits(encoding_));
-  const float dscale = scale_lut(EncodingConfig::doc_bits(encoding_));
-
-  const float ax = x.correction.lower_interval;
-  const float ay = q.corr.lower_interval;
-  const float lx = (x.correction.upper_interval - ax) * dscale;
-  const float ly = (q.corr.upper_interval - ay) * qscale;
-  const float sx = static_cast<float>(x.correction.quantized_component_sum);
-  const float sy = static_cast<float>(q.corr.quantized_component_sum);
+  const float ax = correction.lower_interval;
+  const float ay = q.ay;
+  const float lx = (correction.upper_interval - ax) * doc_scale_;
+  const float ly = q.ly;
+  const float sx = static_cast<float>(correction.quantized_component_sum);
+  const float sy = q.sy;
 
   float score =
       ax * ay * static_cast<float>(dims_) + ay * lx * sx + ax * ly * sy + lx * ly * qc_dist;
 
   if (similarity_ == Similarity::EUCLIDEAN) {
-    score = q.corr.additional_correction + x.correction.additional_correction - 2.0f * score;
+    score = q.additional_correction + correction.additional_correction - 2.0f * score;
     if (score < 0.0f) score = 0.0f;
     return 1.0f / (1.0f + score);
   }
 
-  score += q.corr.additional_correction + x.correction.additional_correction - centroid_dp_;
+  score += q.additional_correction + correction.additional_correction - centroid_dp_;
 
   if (similarity_ == Similarity::MAX_INNER_PRODUCT) {
     return scale_max_inner_product_score(score);
@@ -380,11 +426,25 @@ void OSQIndex::add(size_t n, const float* x) {
       encoded[i] = encode_doc(x + i * dims_);
     }
   });
-  docs_.reserve(docs_.size() + n);
-  docs_.insert(
-      docs_.end(),
-      std::make_move_iterator(encoded.begin()),
-      std::make_move_iterator(encoded.end()));
+  const size_t old_size = corrections_.size();
+  corrections_.resize(old_size + n);
+  packed_codes_.resize((old_size + n) * doc_packed_len_);
+  for (size_t i = 0; i < n; ++i) {
+    corrections_[old_size + i] = encoded[i].correction;
+    std::memcpy(
+        packed_codes_.data() + (old_size + i) * doc_packed_len_,
+        encoded[i].packed.data(),
+        doc_packed_len_);
+  }
+}
+
+void OSQIndex::prefetch_doc(idx_t id) const {
+  if (id < 0 || static_cast<size_t>(id) >= corrections_.size()) {
+    return;
+  }
+  const size_t idx = static_cast<size_t>(id);
+  __builtin_prefetch(doc_packed_ptr(idx), 0, 1);
+  __builtin_prefetch(&doc_correction(idx), 0, 1);
 }
 
 void OSQIndex::search(size_t nq, const float* queries, size_t k, float* distances, idx_t* labels) const {
@@ -408,44 +468,45 @@ void OSQIndex::search(size_t nq, const float* queries, size_t k, float* distance
       float worst_score = -std::numeric_limits<float>::infinity();
       size_t worst_idx = 0;
 
-      for (size_t i = 0; i < docs_.size(); ++i) {
-        if (i + kPrefetchDistance < docs_.size()) {
-          __builtin_prefetch(docs_[i + kPrefetchDistance].packed.data(), 0, 1);
-          __builtin_prefetch(&docs_[i + kPrefetchDistance].correction, 0, 1);
+      for (size_t i = 0; i < corrections_.size(); ++i) {
+        if (i + kPrefetchDistance < corrections_.size()) {
+          __builtin_prefetch(doc_packed_ptr(i + kPrefetchDistance), 0, 1);
+          __builtin_prefetch(&doc_correction(i + kPrefetchDistance), 0, 1);
         }
 
-        const EncodedVector& x = docs_[i];
+        const uint8_t* packed = doc_packed_ptr(i);
+        const QuantizationResult& correction = doc_correction(i);
         float qc_dist = 0.0f;
         switch (encoding_) {
           case ScalarEncoding::UNSIGNED_BYTE:
           case ScalarEncoding::SEVEN_BIT:
-            qc_dist = static_cast<float>(dot_uint8(eq.q.data(), x.packed.data(), dd));
+            qc_dist = static_cast<float>(dot_uint8(eq.q.data(), packed, dd));
             break;
           case ScalarEncoding::PACKED_NIBBLE:
-            qc_dist = static_cast<float>(dot_int4_with_packed_doc(eq.q.data(), x.packed.data(), dd));
+            qc_dist = static_cast<float>(dot_int4_with_packed_doc(eq.q.data(), packed, dd));
             break;
           case ScalarEncoding::SINGLE_BIT_QUERY_NIBBLE:
             qc_dist = static_cast<float>(dot_int4_with_binary_doc_transposed(
-                eq.q.data(), x.packed.data(), dd));
+                eq.q.data(), packed, dd));
             break;
           case ScalarEncoding::DIBIT_QUERY_NIBBLE:
             qc_dist = static_cast<float>(dot_int4_with_dibit_doc_transposed(
-                eq.q.data(), x.packed.data(), dd));
+                eq.q.data(), packed, dd));
             break;
         }
 
-        const float ax = x.correction.lower_interval;
-        const float lx = (x.correction.upper_interval - ax) * dscale;
-        const float sx = static_cast<float>(x.correction.quantized_component_sum);
+        const float ax = correction.lower_interval;
+        const float lx = (correction.upper_interval - ax) * dscale;
+        const float sx = static_cast<float>(correction.quantized_component_sum);
         float score =
             ax * ay * static_cast<float>(dims_) + ay * lx * sx + ax * ly * sy + lx * ly * qc_dist;
 
         if (similarity_ == Similarity::EUCLIDEAN) {
-          score = q_add + x.correction.additional_correction - 2.0f * score;
+          score = q_add + correction.additional_correction - 2.0f * score;
           if (score < 0.0f) score = 0.0f;
           score = 1.0f / (1.0f + score);
         } else {
-          score += q_add + x.correction.additional_correction - centroid_dp_;
+          score += q_add + correction.additional_correction - centroid_dp_;
           if (similarity_ == Similarity::MAX_INNER_PRODUCT) {
             score = scale_max_inner_product_score(score);
           } else {
@@ -505,10 +566,32 @@ float OSQIndex::score(const float* query, idx_t id) const {
 
 float OSQIndex::score(const EncodedQuery& query, idx_t id) const {
   if (!trained_) throw std::runtime_error("index is not trained");
-  if (id < 0 || static_cast<size_t>(id) >= docs_.size()) {
+  if (id < 0 || static_cast<size_t>(id) >= corrections_.size()) {
     throw std::out_of_range("OSQIndex::score id out of range");
   }
-  return score_query_doc(query, docs_[static_cast<size_t>(id)]);
+  const size_t idx = static_cast<size_t>(id);
+  return score_query_doc(query, doc_packed_ptr(idx), doc_correction(idx));
+}
+
+void OSQIndex::score_batch_4(
+    const EncodedQuery& query,
+    idx_t id0,
+    idx_t id1,
+    idx_t id2,
+    idx_t id3,
+    float& s0,
+    float& s1,
+    float& s2,
+    float& s3) const {
+  if (!trained_) throw std::runtime_error("index is not trained");
+  prefetch_doc(id0);
+  prefetch_doc(id1);
+  prefetch_doc(id2);
+  prefetch_doc(id3);
+  s0 = score(query, id0);
+  s1 = score(query, id1);
+  s2 = score(query, id2);
+  s3 = score(query, id3);
 }
 
 bool OSQIndex::save(const std::string& path) const {
@@ -538,17 +621,20 @@ bool OSQIndex::save(const std::string& path) const {
   write_u64(centroid_size);
   ofs.write(reinterpret_cast<const char*>(centroid_.data()), centroid_size * sizeof(float));
 
-  const uint64_t docs_size = static_cast<uint64_t>(docs_.size());
+  const uint64_t docs_size = static_cast<uint64_t>(corrections_.size());
   write_u64(docs_size);
-  for (const auto& doc : docs_) {
-    const uint64_t packed_size = static_cast<uint64_t>(doc.packed.size());
+  for (size_t i = 0; i < corrections_.size(); ++i) {
+    const auto& correction = corrections_[i];
+    const uint64_t packed_size = static_cast<uint64_t>(doc_packed_len_);
     write_u64(packed_size);
-    ofs.write(reinterpret_cast<const char*>(&doc.correction.lower_interval), sizeof(float));
-    ofs.write(reinterpret_cast<const char*>(&doc.correction.upper_interval), sizeof(float));
-    ofs.write(reinterpret_cast<const char*>(&doc.correction.additional_correction), sizeof(float));
-    ofs.write(reinterpret_cast<const char*>(&doc.correction.quantized_component_sum), sizeof(int));
+    ofs.write(reinterpret_cast<const char*>(&correction.lower_interval), sizeof(float));
+    ofs.write(reinterpret_cast<const char*>(&correction.upper_interval), sizeof(float));
+    ofs.write(reinterpret_cast<const char*>(&correction.additional_correction), sizeof(float));
+    ofs.write(reinterpret_cast<const char*>(&correction.quantized_component_sum), sizeof(int));
     if (packed_size > 0) {
-      ofs.write(reinterpret_cast<const char*>(doc.packed.data()), packed_size * sizeof(uint8_t));
+      ofs.write(
+          reinterpret_cast<const char*>(doc_packed_ptr(i)),
+          packed_size * sizeof(uint8_t));
     }
   }
 
@@ -601,20 +687,22 @@ bool OSQIndex::load(const std::string& path) {
   }
 
   const uint64_t docs_size = read_u64();
-  const size_t expected_packed_size = EncodingConfig::doc_packed_len(encoding_, dims_);
-  std::vector<EncodedVector> docs(static_cast<size_t>(docs_size));
+  const size_t expected_packed_size = doc_packed_len_;
+  std::vector<QuantizationResult> corrections(static_cast<size_t>(docs_size));
+  std::vector<uint8_t> packed_codes(static_cast<size_t>(docs_size) * expected_packed_size);
   for (uint64_t i = 0; i < docs_size; ++i) {
     const uint64_t packed_size = read_u64();
     if (packed_size != expected_packed_size) {
       return false;
     }
-    ifs.read(reinterpret_cast<char*>(&docs[i].correction.lower_interval), sizeof(float));
-    ifs.read(reinterpret_cast<char*>(&docs[i].correction.upper_interval), sizeof(float));
-    ifs.read(reinterpret_cast<char*>(&docs[i].correction.additional_correction), sizeof(float));
-    ifs.read(reinterpret_cast<char*>(&docs[i].correction.quantized_component_sum), sizeof(int));
-    docs[i].packed.resize(static_cast<size_t>(packed_size));
+    ifs.read(reinterpret_cast<char*>(&corrections[i].lower_interval), sizeof(float));
+    ifs.read(reinterpret_cast<char*>(&corrections[i].upper_interval), sizeof(float));
+    ifs.read(reinterpret_cast<char*>(&corrections[i].additional_correction), sizeof(float));
+    ifs.read(reinterpret_cast<char*>(&corrections[i].quantized_component_sum), sizeof(int));
     if (packed_size > 0) {
-      ifs.read(reinterpret_cast<char*>(docs[i].packed.data()), packed_size * sizeof(uint8_t));
+      ifs.read(
+          reinterpret_cast<char*>(packed_codes.data() + i * expected_packed_size),
+          packed_size * sizeof(uint8_t));
     }
   }
 
@@ -626,7 +714,8 @@ bool OSQIndex::load(const std::string& path) {
   num_threads_ = static_cast<int>(num_threads);
   centroid_dp_ = centroid_dp;
   centroid_ = std::move(centroid);
-  docs_ = std::move(docs);
+  corrections_ = std::move(corrections);
+  packed_codes_ = std::move(packed_codes);
   return true;
 }
 
