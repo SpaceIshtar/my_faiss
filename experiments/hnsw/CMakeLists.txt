@@ -77,6 +77,7 @@ target_link_libraries(bench_hnswpq PRIVATE faiss_avx512 OpenMP::OpenMP_CXX)
 # ============================================================
 add_executable(bench_hnsw_quant EXCLUDE_FROM_ALL bench_hnsw_quant.cpp)
 target_sources(bench_hnsw_quant PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/turboquant_wrapper.cpp
     ${OSQ_DIR}/OptimizedScalarQuantizer.cpp
     ${OSQ_DIR}/OSQIndex.cpp
 )
