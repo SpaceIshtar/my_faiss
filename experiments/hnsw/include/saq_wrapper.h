@@ -30,6 +30,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <array>
 #include <vector>
 
 namespace hnsw_bench {
@@ -53,13 +54,21 @@ class SAQDistanceComputer : public faiss::DistanceComputer {
     }
 
    private:
+    struct PreparedClusterState {
+        std::unique_ptr<saqlib::SaqCluEstimator<saqlib::DistType::L2Sqr>> estimator;
+        uint32_t prepared_block = std::numeric_limits<uint32_t>::max();
+        alignas(64) std::array<__m512, 2> fast_block_cache;
+    };
+
     const SAQWrapper* parent_;
     saqlib::SearcherConfig searcher_cfg_;
     saqlib::FloatVec query_;
+    bool use_cluster_cache_ = false;
     std::unique_ptr<saqlib::SaqCluEstimator<saqlib::DistType::L2Sqr>> estimator_;
     uint32_t prepared_cluster_ = std::numeric_limits<uint32_t>::max();
     uint32_t prepared_block_ = std::numeric_limits<uint32_t>::max();
-    alignas(64) __m512 fast_block_cache_[2];
+    alignas(64) std::array<__m512, 2> fast_block_cache_;
+    std::vector<PreparedClusterState> cluster_cache_;
 };
 
 class SAQWrapper : public QuantWrapper {
@@ -72,6 +81,7 @@ class SAQWrapper : public QuantWrapper {
             int seg_eqseg = 0,
             bool use_compact_layout = false,
             bool random_rotation = true,
+            bool cluster_cache_enabled = false,
             faiss::MetricType metric = faiss::METRIC_L2)
             : d_(d),
               avg_bits_(avg_bits),
@@ -80,6 +90,7 @@ class SAQWrapper : public QuantWrapper {
               seg_eqseg_(seg_eqseg),
               use_compact_layout_(use_compact_layout),
               random_rotation_(random_rotation),
+              cluster_cache_enabled_(cluster_cache_enabled),
               metric_(metric) {
         if (d_ == 0) {
             throw std::runtime_error("SAQWrapper: dimension must be > 0");
@@ -398,6 +409,7 @@ class SAQWrapper : public QuantWrapper {
     int seg_eqseg_;
     bool use_compact_layout_;
     bool random_rotation_;
+    bool cluster_cache_enabled_;
     faiss::MetricType metric_;
 
     size_t ntotal_ = 0;
@@ -415,16 +427,24 @@ class SAQWrapper : public QuantWrapper {
 inline void SAQDistanceComputer::set_query(const float* x) {
     query_.resize(parent_->d_);
     std::memcpy(query_.data(), x, sizeof(float) * parent_->d_);
-    estimator_ = std::make_unique<saqlib::SaqCluEstimator<saqlib::DistType::L2Sqr>>(
-            *parent_->saq_data_,
-            searcher_cfg_,
-            query_);
-    prepared_cluster_ = std::numeric_limits<uint32_t>::max();
-    prepared_block_ = std::numeric_limits<uint32_t>::max();
+    use_cluster_cache_ = parent_->cluster_cache_enabled_;
+    if (use_cluster_cache_) {
+        cluster_cache_.clear();
+        cluster_cache_.resize(parent_->clusters_.size());
+        estimator_.reset();
+    } else {
+        cluster_cache_.clear();
+        estimator_ = std::make_unique<saqlib::SaqCluEstimator<saqlib::DistType::L2Sqr>>(
+                *parent_->saq_data_,
+                searcher_cfg_,
+                query_);
+        prepared_cluster_ = std::numeric_limits<uint32_t>::max();
+        prepared_block_ = std::numeric_limits<uint32_t>::max();
+    }
 }
 
 inline float SAQDistanceComputer::operator()(faiss::idx_t i) {
-    if (!estimator_ || i < 0 || static_cast<size_t>(i) >= parent_->ntotal_) {
+    if (i < 0 || static_cast<size_t>(i) >= parent_->ntotal_) {
         return std::numeric_limits<float>::infinity();
     }
 
@@ -437,19 +457,38 @@ inline float SAQDistanceComputer::operator()(faiss::idx_t i) {
         return std::numeric_limits<float>::infinity();
     }
 
-    if (cid != prepared_cluster_) {
-        estimator_->prepare(parent_->clusters_[cid].get());
-        prepared_cluster_ = cid;
-        prepared_block_ = std::numeric_limits<uint32_t>::max();
-    }
-
-    // Upstream SAQ estimator requires compFastDist(block) before compAccurateDist(vec).
+    float dist = std::numeric_limits<float>::infinity();
     const uint32_t block = off / saqlib::KFastScanSize;
-    if (block != prepared_block_) {
-        estimator_->compFastDist(block, fast_block_cache_);
-        prepared_block_ = block;
+    if (use_cluster_cache_) {
+        auto& state = cluster_cache_[cid];
+        if (!state.estimator) {
+            state.estimator =
+                    std::make_unique<saqlib::SaqCluEstimator<saqlib::DistType::L2Sqr>>(
+                            *parent_->saq_data_,
+                            searcher_cfg_,
+                            query_);
+            state.estimator->prepare(parent_->clusters_[cid].get());
+            state.prepared_block = std::numeric_limits<uint32_t>::max();
+        }
+
+        if (block != state.prepared_block) {
+            state.estimator->compFastDist(block, state.fast_block_cache.data());
+            state.prepared_block = block;
+        }
+        dist = state.estimator->compAccurateDist(off);
+    } else {
+        if (cid != prepared_cluster_) {
+            estimator_->prepare(parent_->clusters_[cid].get());
+            prepared_cluster_ = cid;
+            prepared_block_ = std::numeric_limits<uint32_t>::max();
+        }
+
+        if (block != prepared_block_) {
+            estimator_->compFastDist(block, fast_block_cache_.data());
+            prepared_block_ = block;
+        }
+        dist = estimator_->compAccurateDist(off);
     }
-    const float dist = estimator_->compAccurateDist(off);
     if (!std::isfinite(dist)) {
         return std::numeric_limits<float>::infinity();
     }
@@ -471,6 +510,7 @@ inline std::unique_ptr<QuantWrapper> create_saq_wrapper(
     int seg_eqseg = 0;
     bool use_compact_layout = false;
     bool random_rotation = true;
+    bool cluster_cache_enabled = false;
 
     if (auto it = params.find("avg_bits"); it != params.end()) {
         avg_bits = std::stof(it->second);
@@ -496,6 +536,9 @@ inline std::unique_ptr<QuantWrapper> create_saq_wrapper(
     if (auto it = params.find("rand_rotate"); it != params.end()) {
         random_rotation = parse_saq_bool(it->second);
     }
+    if (auto it = params.find("cluster_cache"); it != params.end()) {
+        cluster_cache_enabled = parse_saq_bool(it->second);
+    }
 
     return std::make_unique<SAQWrapper>(
             d,
@@ -505,6 +548,7 @@ inline std::unique_ptr<QuantWrapper> create_saq_wrapper(
             seg_eqseg,
             use_compact_layout,
             random_rotation,
+            cluster_cache_enabled,
             metric);
 }
 

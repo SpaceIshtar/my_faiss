@@ -62,6 +62,7 @@
 #include "include/rabitq_wrapper.h"
 #include "include/saq_wrapper.h"
 #include "include/sq_wrapper.h"
+#include "include/turboquant_wrapper.h"
 #include "include/vaq_wrapper.h"
 
 using namespace hnsw_bench;
@@ -253,6 +254,7 @@ void save_results_to_file(
         const std::string& dataset_name,
         const std::string& algorithm_name,
         const std::string& quant_params,
+        int num_threads,
         int hnsw_M,
         int hnsw_efConstruction,
         size_t nq,
@@ -281,6 +283,7 @@ void save_results_to_file(
         << "  Dataset:           " << dataset_name << "\n"
         << "  Algorithm:         " << algorithm_name << "\n"
         << "  Quant Params:      " << quant_params << "\n"
+        << "  Threads:           " << num_threads << "\n"
         << "  HNSW M:            " << hnsw_M << "\n"
         << "  HNSW efConstruct:  " << hnsw_efConstruction << "\n"
         << "  Num Queries:       " << nq << "\n"
@@ -333,11 +336,18 @@ void save_results_to_file(
 std::string generate_result_filename(
         const std::string& algorithm,
         const std::string& quant_params,
+        int num_threads,
         int hnsw_M,
-        int hnsw_efConstruction) {
+        int hnsw_efConstruction,
+        const std::string& result_tag = "") {
     std::ostringstream oss;
     oss << algorithm << "_" << quant_params
-        << "_M" << hnsw_M << "_efc" << hnsw_efConstruction << ".txt";
+        << "_t" << num_threads
+        << "_M" << hnsw_M << "_efc" << hnsw_efConstruction;
+    if (!result_tag.empty()) {
+        oss << "_" << result_tag;
+    }
+    oss << ".txt";
     return oss.str();
 }
 
@@ -373,6 +383,8 @@ std::unique_ptr<QuantWrapper> create_wrapper(
         return create_saq_wrapper(d, metric, params);
     } else if (algorithm == "osq") {
         return create_osq_wrapper(d, metric, params);
+    } else if (algorithm == "turboquant") {
+        return create_turboquant_wrapper(d, metric, params);
     } else {
         throw std::runtime_error("Unknown algorithm: " + algorithm);
     }
@@ -387,20 +399,43 @@ struct Options {
     std::string algorithm = "sq";
     std::string config_dir = "./config";
     std::string data_path;  // Override
+    std::string result_tag;
     int threads = -1;       // -1 means use config
+    int saq_cluster_cache = -1;  // -1 means use wrapper default
+    int saq_cluster_cache_reuse_estimators = -1;  // -1 means use wrapper default
     std::vector<size_t> ef_values;  // Empty means use config
     double timeout_sec = 3600.0;    // Train+add timeout in seconds (default: 1 hour)
     bool help = false;
 };
 
+int parse_cli_bool(const std::string& value) {
+    if (value == "1" || value == "true" || value == "TRUE" || value == "on" || value == "yes") {
+        return 1;
+    }
+    if (value == "0" || value == "false" || value == "FALSE" || value == "off" || value == "no") {
+        return 0;
+    }
+    throw std::invalid_argument("Expected boolean value, got: " + value);
+}
+
+int parse_cli_bool_or_auto(const std::string& value) {
+    if (value == "auto" || value == "AUTO") {
+        return -1;
+    }
+    return parse_cli_bool(value);
+}
+
 void print_usage(const char* prog) {
     std::cout << "Usage: " << prog << " --dataset <name> --algorithm <name> [options]\n\n"
               << "Options:\n"
               << "  --dataset <name>       Dataset name (e.g., sift1m)\n"
-              << "  --algorithm <name>     Algorithm name (pq, opq, sq, rq, lsq, prq, plsq, vaq, rabitq, saq)\n"
+              << "  --algorithm <name>     Algorithm name (pq, opq, sq, rq, lsq, prq, plsq, vaq, rabitq, saq, osq, turboquant)\n"
               << "  --config-dir <path>    Config directory (default: ./config)\n"
               << "  --data-path <path>     Override dataset base path\n"
               << "  --threads <n>          Number of threads\n"
+              << "  --result-tag <tag>     Extra suffix for result filename\n"
+              << "  --saq-cluster-cache <bool>  Enable SAQ per-query cluster cache\n"
+              << "  --saq-cluster-cache-reuse-estimators <bool>  Reuse SAQ cluster estimators across queries (default: auto)\n"
               << "  --ef <list>            Comma-separated ef values to test\n"
               << "  --timeout <seconds>    Train+add timeout per param set (default: 3600)\n"
               << "  --help                 Show this help\n\n"
@@ -426,6 +461,13 @@ Options parse_args(int argc, char** argv) {
             opts.data_path = argv[++i];
         } else if (arg == "--threads" && i + 1 < argc) {
             opts.threads = std::stoi(argv[++i]);
+        } else if (arg == "--result-tag" && i + 1 < argc) {
+            opts.result_tag = argv[++i];
+        } else if (arg == "--saq-cluster-cache" && i + 1 < argc) {
+            opts.saq_cluster_cache = parse_cli_bool(argv[++i]);
+        } else if (arg == "--saq-cluster-cache-reuse-estimators" && i + 1 < argc) {
+            opts.saq_cluster_cache_reuse_estimators =
+                parse_cli_bool_or_auto(argv[++i]);
         } else if (arg == "--ef" && i + 1 < argc) {
             std::string ef_str = argv[++i];
             std::istringstream iss(ef_str);
@@ -544,6 +586,10 @@ int main(int argc, char** argv) {
             param_sets.push_back({.params = {{"encoding", "PACKED_NIBBLE"}, {"similarity", "EUCLIDEAN"}}});
             param_sets.push_back({.params = {{"encoding", "SINGLE_BIT_QUERY_NIBBLE"}, {"similarity", "EUCLIDEAN"}}});
             param_sets.push_back({.params = {{"encoding", "DIBIT_QUERY_NIBBLE"}, {"similarity", "EUCLIDEAN"}}});
+        } else if (opts.algorithm == "turboquant") {
+            param_sets.push_back({.params = {{"bits", "2"}, {"seed", "1234"}}});
+            param_sets.push_back({.params = {{"bits", "3"}, {"seed", "1234"}}});
+            param_sets.push_back({.params = {{"bits", "4"}, {"seed", "1234"}}});
         }
     }
 
@@ -590,8 +636,26 @@ int main(int argc, char** argv) {
         std::cout << "==================================================" << std::endl;
 
         // Create wrapper and generate save path
-        std::shared_ptr<QuantWrapper> quant(
-            create_wrapper(opts.algorithm, d, faiss::METRIC_L2, ps.params).release());
+        auto wrapper_params = ps.params;
+        if (opts.algorithm == "saq" && opts.saq_cluster_cache != -1) {
+            wrapper_params["cluster_cache"] = opts.saq_cluster_cache ? "true" : "false";
+        }
+        if (opts.algorithm == "saq" &&
+            opts.saq_cluster_cache_reuse_estimators != -1) {
+            wrapper_params["cluster_cache_reuse_estimators"] =
+                opts.saq_cluster_cache_reuse_estimators ? "true" : "false";
+        } else if (opts.algorithm == "saq") {
+            wrapper_params["cluster_cache_reuse_estimators"] = "auto";
+        }
+        std::shared_ptr<QuantWrapper> quant;
+        try {
+            quant.reset(
+                create_wrapper(opts.algorithm, d, faiss::METRIC_L2, wrapper_params).release());
+        } catch (const std::exception& e) {
+            std::cout << "WARNING: Failed to create wrapper for parameter set "
+                      << ps.to_string() << ": " << e.what() << std::endl;
+            continue;
+        }
         std::string quant_params_str = quant->get_params_string();
         std::string quant_save_path = get_quant_index_path(
             ds_cfg.base_path, opts.algorithm, quant_params_str);
@@ -620,7 +684,7 @@ int main(int argc, char** argv) {
             Timer timer;
 
             while (!train_done.load(std::memory_order_acquire)) {
-                std::this_thread::sleep_for(std::chrono::seconds(5));
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 if (timer.elapsed_sec() >= opts.timeout_sec) break;
             }
 
@@ -668,12 +732,13 @@ int main(int argc, char** argv) {
 
         // Save results to file
         std::string result_filename = generate_result_filename(
-            opts.algorithm, quant_params_str, ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction);
+            opts.algorithm, quant_params_str, ds_cfg.threads,
+            ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction, opts.result_tag);
         std::string result_dir = "experiments/hnsw/results/" + opts.dataset + "/" + opts.algorithm;
         std::string result_path = result_dir + "/" + result_filename;
 
         save_results_to_file(
-            result_path, opts.dataset, opts.algorithm, quant_params_str,
+            result_path, opts.dataset, opts.algorithm, quant_params_str, ds_cfg.threads,
             ds_cfg.hnsw_M, ds_cfg.hnsw_efConstruction,
             nq, ds_cfg.k, results);
     }
