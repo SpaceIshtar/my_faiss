@@ -18,7 +18,7 @@ matplotlib.rcParams.update({
 })
 
 # ── Configuration ──────────────────────────────────────────────
-DATASET = "paper"
+DATASET = "sift1M"
 ALGORITHMS = {
     "Standard": "standard",
     "PQ": "pq",
@@ -31,9 +31,11 @@ ALGORITHMS = {
     "PQR": "prq",
     "LSQ": "lsq",
     "PLSQ": "plsq",
+    "SAQ": "saq",
+    "TurboQuant": "turboquant",
 }
 TARGET_RECALL = 0.90
-NAME = "paper_qps_recall_0.90.pdf"
+NAME = "sift1M_qps_recall_0.90.pdf"
 
 # ── Paths ──────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +61,8 @@ STYLES = {
     "PQR":          {"color": "#7f7f7f", "marker": "*",  "linestyle": "-"},
     "LSQ":          {"color": "#bcbd22", "marker": "p",  "linestyle": "-"},
     "PLSQ":         {"color": "#17becf", "marker": "d",  "linestyle": "-"},
+    "SAQ":          {"color": "#f39c12", "marker": "8",  "linestyle": "-"},
+    "TurboQuant":   {"color": "#00acc1", "marker": "H",  "linestyle": "-"},
     "SymphonyQG":   {"color": "#ff1493", "marker": "<",  "linestyle": "-"},
     "HVS":          {"color": "#1b3a8a", "marker": ">",  "linestyle": "-"},
 }

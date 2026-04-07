@@ -381,10 +381,10 @@ std::unique_ptr<QuantWrapper> create_wrapper(
         return create_rabitq_wrapper(d, metric, params);
     } else if (algorithm == "saq") {
         return create_saq_wrapper(d, metric, params);
-    } else if (algorithm == "osq") {
-        return create_osq_wrapper(d, metric, params);
     } else if (algorithm == "turboquant") {
         return create_turboquant_wrapper(d, metric, params);
+    } else if (algorithm == "osq") {
+        return create_osq_wrapper(d, metric, params);
     } else {
         throw std::runtime_error("Unknown algorithm: " + algorithm);
     }
@@ -402,7 +402,6 @@ struct Options {
     std::string result_tag;
     int threads = -1;       // -1 means use config
     int saq_cluster_cache = -1;  // -1 means use wrapper default
-    int saq_cluster_cache_reuse_estimators = -1;  // -1 means use wrapper default
     std::vector<size_t> ef_values;  // Empty means use config
     double timeout_sec = 3600.0;    // Train+add timeout in seconds (default: 1 hour)
     bool help = false;
@@ -418,24 +417,16 @@ int parse_cli_bool(const std::string& value) {
     throw std::invalid_argument("Expected boolean value, got: " + value);
 }
 
-int parse_cli_bool_or_auto(const std::string& value) {
-    if (value == "auto" || value == "AUTO") {
-        return -1;
-    }
-    return parse_cli_bool(value);
-}
-
 void print_usage(const char* prog) {
     std::cout << "Usage: " << prog << " --dataset <name> --algorithm <name> [options]\n\n"
               << "Options:\n"
               << "  --dataset <name>       Dataset name (e.g., sift1m)\n"
-              << "  --algorithm <name>     Algorithm name (pq, opq, sq, rq, lsq, prq, plsq, vaq, rabitq, saq, osq, turboquant)\n"
+              << "  --algorithm <name>     Algorithm name (pq, opq, sq, rq, lsq, prq, plsq, vaq, rabitq, saq, turboquant, osq)\n"
               << "  --config-dir <path>    Config directory (default: ./config)\n"
               << "  --data-path <path>     Override dataset base path\n"
               << "  --threads <n>          Number of threads\n"
               << "  --result-tag <tag>     Extra suffix for result filename\n"
               << "  --saq-cluster-cache <bool>  Enable SAQ per-query cluster cache\n"
-              << "  --saq-cluster-cache-reuse-estimators <bool>  Reuse SAQ cluster estimators across queries (default: auto)\n"
               << "  --ef <list>            Comma-separated ef values to test\n"
               << "  --timeout <seconds>    Train+add timeout per param set (default: 3600)\n"
               << "  --help                 Show this help\n\n"
@@ -465,9 +456,6 @@ Options parse_args(int argc, char** argv) {
             opts.result_tag = argv[++i];
         } else if (arg == "--saq-cluster-cache" && i + 1 < argc) {
             opts.saq_cluster_cache = parse_cli_bool(argv[++i]);
-        } else if (arg == "--saq-cluster-cache-reuse-estimators" && i + 1 < argc) {
-            opts.saq_cluster_cache_reuse_estimators =
-                parse_cli_bool_or_auto(argv[++i]);
         } else if (arg == "--ef" && i + 1 < argc) {
             std::string ef_str = argv[++i];
             std::istringstream iss(ef_str);
@@ -582,14 +570,14 @@ int main(int argc, char** argv) {
             param_sets.push_back({.params = {{"bits", "1"}, {"clusters", "4096"}}});
             param_sets.push_back({.params = {{"bits", "2"}, {"clusters", "4096"}}});
             param_sets.push_back({.params = {{"bits", "4"}, {"clusters", "4096"}}});
-        } else if (opts.algorithm == "osq") {
-            param_sets.push_back({.params = {{"encoding", "PACKED_NIBBLE"}, {"similarity", "EUCLIDEAN"}}});
-            param_sets.push_back({.params = {{"encoding", "SINGLE_BIT_QUERY_NIBBLE"}, {"similarity", "EUCLIDEAN"}}});
-            param_sets.push_back({.params = {{"encoding", "DIBIT_QUERY_NIBBLE"}, {"similarity", "EUCLIDEAN"}}});
         } else if (opts.algorithm == "turboquant") {
             param_sets.push_back({.params = {{"bits", "2"}, {"seed", "1234"}}});
             param_sets.push_back({.params = {{"bits", "3"}, {"seed", "1234"}}});
             param_sets.push_back({.params = {{"bits", "4"}, {"seed", "1234"}}});
+        } else if (opts.algorithm == "osq") {
+            param_sets.push_back({.params = {{"encoding", "PACKED_NIBBLE"}, {"similarity", "EUCLIDEAN"}}});
+            param_sets.push_back({.params = {{"encoding", "SINGLE_BIT_QUERY_NIBBLE"}, {"similarity", "EUCLIDEAN"}}});
+            param_sets.push_back({.params = {{"encoding", "DIBIT_QUERY_NIBBLE"}, {"similarity", "EUCLIDEAN"}}});
         }
     }
 
@@ -640,12 +628,8 @@ int main(int argc, char** argv) {
         if (opts.algorithm == "saq" && opts.saq_cluster_cache != -1) {
             wrapper_params["cluster_cache"] = opts.saq_cluster_cache ? "true" : "false";
         }
-        if (opts.algorithm == "saq" &&
-            opts.saq_cluster_cache_reuse_estimators != -1) {
-            wrapper_params["cluster_cache_reuse_estimators"] =
-                opts.saq_cluster_cache_reuse_estimators ? "true" : "false";
-        } else if (opts.algorithm == "saq") {
-            wrapper_params["cluster_cache_reuse_estimators"] = "auto";
+        if (opts.algorithm == "turboquant") {
+            wrapper_params["threads"] = std::to_string(ds_cfg.threads);
         }
         std::shared_ptr<QuantWrapper> quant;
         try {

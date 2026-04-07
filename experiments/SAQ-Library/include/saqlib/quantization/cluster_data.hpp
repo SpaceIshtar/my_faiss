@@ -1,14 +1,19 @@
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
+#include <limits>
 #include <stdlib.h>
 #include <vector>
 
 #include <glog/logging.h>
 
 #include "defines.hpp"
+#include "quantization/fastscan/fastscan.hpp"
 #include "utils/memory.hpp"
 #include "utils/tools.hpp"
 
@@ -37,17 +42,18 @@ class CAQClusterData {
   public:
     static constexpr size_t kNumShortFactors = 2; // factors packed into shortdata
 
-    const size_t num_vec_;        // Num of vectors in this cluster
-    const size_t num_vec_align_;  // Padded number of vectors (multiple of 32)
+    size_t num_vec_;              // Num of vectors in this cluster
+    size_t num_vec_align_;        // Padded number of vectors (multiple of 32)
     const size_t num_dim_padded_; // Padded number of dimension (multiple of 64)
     const size_t num_bits_;       // bits
-    const size_t num_blocks_;     // Num of blocks
+    size_t num_blocks_;           // Num of blocks
   private:
     size_t shortb_factors_num_; // number of short block factors (in float)
     size_t shortb_code_bytes_;  // bytes of short block code
     size_t longb_code_bytes_;   // bytes of long block code
 
     size_t num_parallel_clusters_ = 1; // number of parallel clusters, that is, segments
+    bool use_fastscan_ = true;
 
     bool should_free_ = false;
     float *short_factors_ = nullptr;   // short factors
@@ -78,6 +84,12 @@ class CAQClusterData {
           shortb_code_bytes_(num_bits ? num_dim_paded * KFastScanSize / 8 * sizeof(uint8_t) : 0),
           longb_code_bytes_(num_bits ? num_dim_paded * (num_bits - 1) / 8 : 0) {
         centroid_.resize(num_dim_paded);
+    }
+
+    void set_num_vec(size_t num_vec) {
+        num_vec_ = num_vec;
+        num_vec_align_ = utils::rd_up_to_multiple_of(num_vec, KFastScanSize);
+        num_blocks_ = utils::div_rd_up(num_vec, KFastScanSize);
     }
 
     ~CAQClusterData() {
@@ -153,6 +165,74 @@ class CAQClusterData {
     auto num_blocks() const { return num_blocks_; }
     auto iter() const { return num_vec_ / KFastScanSize; }
     auto remain() const { return num_vec_ % KFastScanSize; }
+    auto short_code_byte_num() const { return num_dim_padded_ / 8; }
+    auto raw_short_factors_num() const { return KFastScanSize * kNumShortFactors; }
+    auto raw_short_code_bytes() const {
+        return num_bits_ ? num_dim_padded_ * KFastScanSize / 8 * sizeof(uint8_t) : 0;
+    }
+    auto raw_long_code_bytes() const {
+        return num_bits_ ? num_dim_padded_ * (num_bits_ - 1) / 8 : 0;
+    }
+
+    void decode_short_block(size_t block_idx, size_t valid_vecs, uint8_t* decoded) const {
+        const size_t code_bytes = short_code_byte_num();
+        std::fill(decoded, decoded + code_bytes * KFastScanSize, 0);
+        if (num_bits_ == 0 || valid_vecs == 0) {
+            return;
+        }
+
+        const uint8_t* block_ptr = short_code(block_idx);
+        if (use_fastscan_) {
+            static constexpr std::array<size_t, 16> kInvPerm = {
+                    0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15};
+            for (size_t col = 0; col < code_bytes; ++col) {
+                const uint8_t* packed_col = block_ptr + col * KFastScanSize;
+                for (size_t vec = 0; vec < valid_vecs; ++vec) {
+                    const size_t base_vec = vec % 16;
+                    const size_t perm_idx = kInvPerm[base_vec];
+                    const uint8_t high_nibble =
+                            vec < 16 ? (packed_col[perm_idx] & 0x0f)
+                                     : ((packed_col[perm_idx] >> 4) & 0x0f);
+                    const uint8_t low_nibble =
+                            vec < 16 ? (packed_col[perm_idx + 16] & 0x0f)
+                                     : ((packed_col[perm_idx + 16] >> 4) & 0x0f);
+                    decoded[vec * code_bytes + col] =
+                            static_cast<uint8_t>((high_nibble << 4) | low_nibble);
+                }
+            }
+        } else {
+            std::vector<uint8_t> canonical(code_bytes * KFastScanSize);
+            std::memcpy(canonical.data(), block_ptr, canonical.size());
+            for (size_t j = 0; j < canonical.size(); j += 8) {
+                std::swap(canonical[j + 0], canonical[j + 7]);
+                std::swap(canonical[j + 1], canonical[j + 6]);
+                std::swap(canonical[j + 2], canonical[j + 5]);
+                std::swap(canonical[j + 3], canonical[j + 4]);
+            }
+            std::memcpy(decoded, canonical.data(), code_bytes * valid_vecs);
+        }
+    }
+
+    void encode_short_block(const uint8_t* decoded, size_t valid_vecs, uint8_t* block_ptr) const {
+        if (num_bits_ == 0) {
+            return;
+        }
+
+        const size_t code_bytes = short_code_byte_num();
+        std::vector<uint8_t> canonical(code_bytes * KFastScanSize, 0);
+        std::memcpy(canonical.data(), decoded, code_bytes * valid_vecs);
+        if (use_fastscan_) {
+            fastscan::pack_codes(num_dim_padded_, canonical.data(), valid_vecs, block_ptr);
+        } else {
+            for (size_t j = 0; j < canonical.size(); j += 8) {
+                std::swap(canonical[j + 0], canonical[j + 7]);
+                std::swap(canonical[j + 1], canonical[j + 6]);
+                std::swap(canonical[j + 2], canonical[j + 5]);
+                std::swap(canonical[j + 3], canonical[j + 4]);
+            }
+            std::memcpy(block_ptr, canonical.data(), canonical.size());
+        }
+    }
 
     // void load(std::ifstream &input)
     // {
@@ -180,9 +260,9 @@ class SaqCluData {
     static constexpr size_t kLongCodeAlignBytes = 16;
 
   public:
-    const size_t num_vec_;       // Num of vectors in this segment
-    const size_t num_vec_align_; // Num of vectors in this segment
-    const size_t num_blocks_;    // Num of blocks
+    size_t num_vec_;             // Num of vectors in this segment
+    size_t num_vec_align_;       // Num of vectors in this segment
+    size_t num_blocks_;          // Num of blocks
     const size_t num_segments_;  // Num of segments
   private:
     std::vector<CAQClusterData> segments_;
@@ -197,19 +277,26 @@ class SaqCluData {
     uint8_t *long_code_;                                      // long code
     ExFactor *long_factors_;                                  // extra factors of vectors
     std::vector<PID, memory::AlignedAllocator<PID, 64>> ids_; // PID of vectors
+    bool use_compact_layout_ = false;
+    bool use_fastscan_ = true;
 
   public:
     /**
      * @param num number of vectors
      * @param quant_plan_ quantization plan for each segment. <num_dims, bits>
      */
-    explicit SaqCluData(size_t num_vec, const std::vector<std::pair<size_t, size_t>> &quant_plan, bool use_compact_layout = false)
+    explicit SaqCluData(size_t num_vec,
+                        const std::vector<std::pair<size_t, size_t>> &quant_plan,
+                        bool use_compact_layout = false,
+                        bool use_fastscan = true)
         : num_vec_(num_vec),
           num_vec_align_(utils::rd_up_to_multiple_of(num_vec, KFastScanSize)),
           num_blocks_(utils::div_rd_up(num_vec, KFastScanSize)),
-          num_segments_(quant_plan.size()) {
+          num_segments_(quant_plan.size()),
+          use_compact_layout_(use_compact_layout),
+          use_fastscan_(use_fastscan) {
         if (num_segments_ == 1)
-            use_compact_layout = true;
+            use_compact_layout_ = true;
 
         segments_.reserve(quant_plan.size());
         for (size_t i = 0; i < quant_plan.size(); ++i) {
@@ -217,10 +304,11 @@ class SaqCluData {
             DCHECK_EQ(dim_padded % kDimPaddingSize, 0);
             auto &c = segments_.emplace_back(num_vec, dim_padded, quant_plan[i].second);
             c.num_parallel_clusters_ = num_segments_;
+            c.use_fastscan_ = use_fastscan_;
             shortb_factors_fcnt_ += c.shortb_factors_num_;
             shortb_code_bytes_ += c.shortb_code_bytes_;
 
-            if (use_compact_layout) {
+            if (use_compact_layout_) {
                 longb_code_bytes_ += c.longb_code_bytes_;
                 longb_code_bytes_tot_ += utils::rd_up_to_multiple_of(c.longb_code_bytes_ * num_vec, kLongCodeAlignBytes);
             } else {
@@ -278,7 +366,7 @@ class SaqCluData {
         size_t longb_begin = 0;
         for (size_t i = 0; i < quant_plan.size(); ++i) {
             auto &c = segments_[i];
-            if (use_compact_layout) {
+            if (use_compact_layout_) {
                 c.long_code_ = long_code_ + longb_begin;
                 longb_begin += utils::rd_up_to_multiple_of(c.longb_code_bytes_ * num_vec, kLongCodeAlignBytes);
             } else {
@@ -313,6 +401,201 @@ class SaqCluData {
 
     auto iter() const { return num_vec_ / KFastScanSize; }
     auto remain() const { return num_vec_ % KFastScanSize; }
+    auto use_compact_layout() const { return use_compact_layout_; }
+    auto use_fastscan() const { return use_fastscan_; }
+
+    std::vector<std::pair<size_t, size_t>> quant_plan() const {
+        std::vector<std::pair<size_t, size_t>> plan;
+        plan.reserve(num_segments_);
+        for (const auto& seg : segments_) {
+            plan.emplace_back(seg.num_dim_padded_, seg.num_bits_);
+        }
+        return plan;
+    }
+
+    void resize(size_t new_num_vec) {
+        if (new_num_vec == num_vec_) {
+            return;
+        }
+
+        SaqCluData grown(new_num_vec, quant_plan(), use_compact_layout_, use_fastscan_);
+
+        for (size_t i = 0; i < num_segments_; ++i) {
+            grown.segments_[i].centroid_ = segments_[i].centroid_;
+        }
+
+        const size_t old_num_vec = num_vec_;
+        const size_t old_num_blocks = num_blocks_;
+        const size_t old_short_factors_bytes =
+                short_factors_ ? shortb_factors_fcnt_ * old_num_blocks * sizeof(float) : 0;
+        const size_t old_short_code_bytes = shortb_code_bytes_ * old_num_blocks;
+        const size_t old_long_factors_bytes = old_num_vec * num_segments_ * sizeof(ExFactor);
+
+        if (old_short_factors_bytes > 0) {
+            std::memcpy(grown.short_factors_, short_factors_, old_short_factors_bytes);
+        }
+        if (old_short_code_bytes > 0) {
+            std::memcpy(grown.short_code_, short_code_, old_short_code_bytes);
+        }
+
+        if (old_num_vec > 0) {
+            if (use_compact_layout_) {
+                for (size_t i = 0; i < num_segments_; ++i) {
+                    const auto raw_long_code_bytes = segments_[i].raw_long_code_bytes();
+                    if (raw_long_code_bytes == 0) {
+                        continue;
+                    }
+                    std::memcpy(
+                            grown.segments_[i].long_code_,
+                            segments_[i].long_code_,
+                            raw_long_code_bytes * old_num_vec);
+                }
+            } else {
+                std::memcpy(
+                        grown.long_code_,
+                        long_code_,
+                        longb_code_bytes_ * old_num_vec);
+            }
+            std::memcpy(grown.long_factors_, long_factors_, old_long_factors_bytes);
+            std::copy(ids_.begin(), ids_.end(), grown.ids_.begin());
+        }
+
+        swap_contents(grown);
+    }
+
+    void append(const SaqCluData& other) {
+        if (other.num_vec_ == 0) {
+            return;
+        }
+
+        CHECK_EQ(num_segments_, other.num_segments_) << "SaqCluData append num_segments mismatch";
+        CHECK_EQ(use_compact_layout_, other.use_compact_layout_) << "SaqCluData append compact-layout mismatch";
+        CHECK_EQ(use_fastscan_, other.use_fastscan_) << "SaqCluData append fastscan mismatch";
+        for (size_t i = 0; i < num_segments_; ++i) {
+            CHECK_EQ(segments_[i].num_dim_padded_, other.segments_[i].num_dim_padded_);
+            CHECK_EQ(segments_[i].num_bits_, other.segments_[i].num_bits_);
+        }
+
+        const size_t old_num_vec = num_vec_;
+        const size_t old_tail = old_num_vec % KFastScanSize;
+        const size_t rewrite_block = old_tail ? (old_num_vec / KFastScanSize) : num_blocks_;
+
+        resize(old_num_vec + other.num_vec_);
+        std::copy(other.ids_.begin(), other.ids_.end(), ids_.begin() + old_num_vec);
+
+        for (size_t seg_idx = 0; seg_idx < num_segments_; ++seg_idx) {
+            auto& dst = segments_[seg_idx];
+            const auto& src = other.segments_[seg_idx];
+            const size_t raw_long_code_bytes = dst.raw_long_code_bytes();
+
+            if (old_num_vec == 0) {
+                dst.centroid_ = src.centroid_;
+            }
+
+            for (size_t i = 0; i < other.num_vec_; ++i) {
+                if (raw_long_code_bytes > 0) {
+                    std::memcpy(
+                            dst.long_code(old_num_vec + i),
+                            src.long_code(i),
+                            raw_long_code_bytes);
+                }
+                dst.long_factor(old_num_vec + i) = src.long_factor(i);
+            }
+
+            std::vector<uint8_t> old_tail_codes(dst.short_code_byte_num() * KFastScanSize, 0);
+            std::array<float, KFastScanSize> old_tail_norms{};
+            std::array<float, KFastScanSize> old_tail_ips{};
+            if (old_tail > 0) {
+                dst.decode_short_block(rewrite_block, old_tail, old_tail_codes.data());
+                std::memcpy(
+                        old_tail_norms.data(),
+                        dst.factor_o_l2norm(rewrite_block),
+                        sizeof(float) * old_tail);
+                std::memcpy(
+                        old_tail_ips.data(),
+                        dst.factor_ip_cent_oa(rewrite_block),
+                        sizeof(float) * old_tail);
+            }
+
+            std::vector<uint8_t> src_block_codes(src.short_code_byte_num() * KFastScanSize, 0);
+            std::vector<uint8_t> dst_block_codes(dst.short_code_byte_num() * KFastScanSize, 0);
+            std::array<float, KFastScanSize> dst_block_norms{};
+            std::array<float, KFastScanSize> dst_block_ips{};
+
+            size_t src_vec_idx = 0;
+            size_t src_block_idx = std::numeric_limits<size_t>::max();
+            for (size_t block_idx = rewrite_block; block_idx < num_blocks_; ++block_idx) {
+                const size_t block_begin = block_idx * KFastScanSize;
+                const size_t block_count = std::min(KFastScanSize, num_vec_ - block_begin);
+                size_t filled = 0;
+
+                std::fill(dst_block_codes.begin(), dst_block_codes.end(), 0);
+                dst_block_norms.fill(0);
+                dst_block_ips.fill(0);
+
+                if (block_idx == rewrite_block && old_tail > 0) {
+                    std::memcpy(
+                            dst_block_codes.data(),
+                            old_tail_codes.data(),
+                            old_tail * dst.short_code_byte_num());
+                    std::memcpy(
+                            dst_block_norms.data(),
+                            old_tail_norms.data(),
+                            sizeof(float) * old_tail);
+                    std::memcpy(
+                            dst_block_ips.data(),
+                            old_tail_ips.data(),
+                            sizeof(float) * old_tail);
+                    filled = old_tail;
+                }
+
+                while (filled < block_count) {
+                    const size_t cur_src_block = src_vec_idx / KFastScanSize;
+                    const size_t src_in_block = src_vec_idx % KFastScanSize;
+                    if (cur_src_block != src_block_idx) {
+                        src_block_idx = cur_src_block;
+                        const size_t src_valid =
+                                std::min(KFastScanSize, src.num_vec_ - src_block_idx * KFastScanSize);
+                        src.decode_short_block(src_block_idx, src_valid, src_block_codes.data());
+                    }
+
+                    const size_t src_avail = std::min(
+                            {block_count - filled,
+                             KFastScanSize - src_in_block,
+                             src.num_vec_ - src_vec_idx});
+
+                    if (dst.short_code_byte_num() > 0) {
+                        std::memcpy(
+                                dst_block_codes.data() + filled * dst.short_code_byte_num(),
+                                src_block_codes.data() + src_in_block * src.short_code_byte_num(),
+                                src_avail * dst.short_code_byte_num());
+                    }
+                    std::memcpy(
+                            dst_block_norms.data() + filled,
+                            src.factor_o_l2norm(src_block_idx) + src_in_block,
+                            sizeof(float) * src_avail);
+                    std::memcpy(
+                            dst_block_ips.data() + filled,
+                            src.factor_ip_cent_oa(src_block_idx) + src_in_block,
+                            sizeof(float) * src_avail);
+                    filled += src_avail;
+                    src_vec_idx += src_avail;
+                }
+
+                if (dst.num_bits_ > 0) {
+                    dst.encode_short_block(dst_block_codes.data(), block_count, dst.short_code(block_idx));
+                }
+                std::memcpy(
+                        dst.factor_o_l2norm(block_idx),
+                        dst_block_norms.data(),
+                        sizeof(float) * KFastScanSize);
+                std::memcpy(
+                        dst.factor_ip_cent_oa(block_idx),
+                        dst_block_ips.data(),
+                        sizeof(float) * KFastScanSize);
+            }
+        }
+    }
 
     void load(std::ifstream &input) {
         input.read((char *)short_factors_, shortb_factors_fcnt_ * num_blocks_ * sizeof(float));
@@ -333,6 +616,26 @@ class SaqCluData {
         for (auto &clu : segments_) {
             output.write((char *)clu.centroid_.data(), clu.centroid_.cols() * sizeof(float));
         }
+    }
+
+  private:
+    void swap_contents(SaqCluData& other) {
+        using std::swap;
+        swap(num_vec_, other.num_vec_);
+        swap(num_vec_align_, other.num_vec_align_);
+        swap(num_blocks_, other.num_blocks_);
+        swap(segments_, other.segments_);
+        swap(shortb_factors_fcnt_, other.shortb_factors_fcnt_);
+        swap(shortb_code_bytes_, other.shortb_code_bytes_);
+        swap(longb_code_bytes_, other.longb_code_bytes_);
+        swap(longb_code_bytes_tot_, other.longb_code_bytes_tot_);
+        swap(short_factors_, other.short_factors_);
+        swap(short_code_, other.short_code_);
+        swap(long_code_, other.long_code_);
+        swap(long_factors_, other.long_factors_);
+        swap(ids_, other.ids_);
+        swap(use_compact_layout_, other.use_compact_layout_);
+        swap(use_fastscan_, other.use_fastscan_);
     }
 };
 } // namespace saqlib

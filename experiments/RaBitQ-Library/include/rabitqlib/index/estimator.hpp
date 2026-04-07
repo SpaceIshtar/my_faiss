@@ -10,6 +10,9 @@
 #include "rabitqlib/utils/space.hpp"
 #include "rabitqlib/utils/warmup_space.hpp"
 
+// Ensure batch-4 helpers from space.hpp are visible
+// (split_single_fulldist_4 / split_single_estdist_4 defined below)
+
 namespace rabitqlib {
 /**
  * @brief Use FastScan to estimate batch distance
@@ -187,5 +190,123 @@ inline void split_single_estdist(
 
     low_dist = est_dist - (cur_bin.f_error() * g_error);
 };
+
+/**
+ * @brief Full-bits distance estimation for 4 vectors simultaneously (ex_bits > 0).
+ *
+ * Optimization vs. calling split_single_fulldist 4×:
+ *   - mask_ip_x0_q_batch_4: loads rotated_query ONCE per 64-element block instead of 4×,
+ *     eliminating 3/4 of the query float-load traffic for that phase.
+ *   - The ex-code IP calls (ip_func_) still run independently but find the query hot in cache.
+ *
+ * low_dist is computed as: est_dist - f_error * g_error / (1 << ex_bits)
+ */
+inline void split_single_fulldist_4(
+    const char* bin_data_0, const char* ex_data_0, float g_add_0, float g_error_0,
+    const char* bin_data_1, const char* ex_data_1, float g_add_1, float g_error_1,
+    const char* bin_data_2, const char* ex_data_2, float g_add_2, float g_error_2,
+    const char* bin_data_3, const char* ex_data_3, float g_add_3, float g_error_3,
+    float (*ip_func)(const float*, const uint8_t*, size_t),
+    const SplitSingleQuery<float>& q_obj,
+    size_t padded_dim,
+    size_t ex_bits,
+    float& est_dist_0, float& low_dist_0,
+    float& est_dist_1, float& low_dist_1,
+    float& est_dist_2, float& low_dist_2,
+    float& est_dist_3, float& low_dist_3
+) {
+    ConstBinDataMap<float> bin0(bin_data_0, padded_dim);
+    ConstBinDataMap<float> bin1(bin_data_1, padded_dim);
+    ConstBinDataMap<float> bin2(bin_data_2, padded_dim);
+    ConstBinDataMap<float> bin3(bin_data_3, padded_dim);
+
+    // Batch: load rotated_query once per block, apply 4 binary masks in parallel.
+    float ip0, ip1, ip2, ip3;
+    mask_ip_x0_q_batch_4(
+        q_obj.rotated_query(),
+        bin0.bin_code(), bin1.bin_code(), bin2.bin_code(), bin3.bin_code(),
+        padded_dim,
+        ip0, ip1, ip2, ip3
+    );
+
+    ConstExDataMap<float> ex0(ex_data_0, padded_dim, ex_bits);
+    ConstExDataMap<float> ex1(ex_data_1, padded_dim, ex_bits);
+    ConstExDataMap<float> ex2(ex_data_2, padded_dim, ex_bits);
+    ConstExDataMap<float> ex3(ex_data_3, padded_dim, ex_bits);
+
+    // Ex-code IP: query is now hot in cache after the batch call above.
+    const float scale    = static_cast<float>(1 << ex_bits);
+    const float kbxsumq  = q_obj.kbxsumq();
+    const float* rq      = q_obj.rotated_query();
+    const float inv_scale = 1.0f / scale;
+
+    est_dist_0 = ex0.f_add_ex() + g_add_0 +
+        ex0.f_rescale_ex() * (scale * ip0 + ip_func(rq, ex0.ex_code(), padded_dim) + kbxsumq);
+    low_dist_0 = est_dist_0 - bin0.f_error() * g_error_0 * inv_scale;
+
+    est_dist_1 = ex1.f_add_ex() + g_add_1 +
+        ex1.f_rescale_ex() * (scale * ip1 + ip_func(rq, ex1.ex_code(), padded_dim) + kbxsumq);
+    low_dist_1 = est_dist_1 - bin1.f_error() * g_error_1 * inv_scale;
+
+    est_dist_2 = ex2.f_add_ex() + g_add_2 +
+        ex2.f_rescale_ex() * (scale * ip2 + ip_func(rq, ex2.ex_code(), padded_dim) + kbxsumq);
+    low_dist_2 = est_dist_2 - bin2.f_error() * g_error_2 * inv_scale;
+
+    est_dist_3 = ex3.f_add_ex() + g_add_3 +
+        ex3.f_rescale_ex() * (scale * ip3 + ip_func(rq, ex3.ex_code(), padded_dim) + kbxsumq);
+    low_dist_3 = est_dist_3 - bin3.f_error() * g_error_3 * inv_scale;
+}
+
+/**
+ * @brief 1-bit distance estimation for 4 vectors simultaneously.
+ *
+ * Optimization vs. calling split_single_estdist 4×:
+ *   - warmup_ip_x0_q_batch_4: loads each query word ONCE and ANDs it against 4 data words,
+ *     turning O(4 * num_blk * b_query) query loads into O(num_blk * b_query) query loads.
+ *
+ * @param g_error_i  Per-vector ||q - c|| norm (used to compute low_dist).
+ * @param low_dist_i Output lower bound: est_dist - f_error * g_error.
+ */
+inline void split_single_estdist_4(
+    const char* bin_data_0, float g_add_0, float g_error_0,
+    const char* bin_data_1, float g_add_1, float g_error_1,
+    const char* bin_data_2, float g_add_2, float g_error_2,
+    const char* bin_data_3, float g_add_3, float g_error_3,
+    const SplitSingleQuery<float>& q_obj,
+    size_t padded_dim,
+    float& est_dist_0, float& low_dist_0,
+    float& est_dist_1, float& low_dist_1,
+    float& est_dist_2, float& low_dist_2,
+    float& est_dist_3, float& low_dist_3
+) {
+    ConstBinDataMap<float> bin0(bin_data_0, padded_dim);
+    ConstBinDataMap<float> bin1(bin_data_1, padded_dim);
+    ConstBinDataMap<float> bin2(bin_data_2, padded_dim);
+    ConstBinDataMap<float> bin3(bin_data_3, padded_dim);
+
+    // Batch: load each query word once, AND against 4 data words.
+    float ip0, ip1, ip2, ip3;
+    warmup_ip_x0_q_batch_4<SplitSingleQuery<float>::kNumBits>(
+        bin0.bin_code(), bin1.bin_code(), bin2.bin_code(), bin3.bin_code(),
+        q_obj.query_bin(),
+        q_obj.delta(), q_obj.vl(),
+        padded_dim,
+        ip0, ip1, ip2, ip3
+    );
+
+    const float k1xsumq = q_obj.k1xsumq();
+
+    est_dist_0 = bin0.f_add() + g_add_0 + bin0.f_rescale() * (ip0 + k1xsumq);
+    low_dist_0 = est_dist_0 - bin0.f_error() * g_error_0;
+
+    est_dist_1 = bin1.f_add() + g_add_1 + bin1.f_rescale() * (ip1 + k1xsumq);
+    low_dist_1 = est_dist_1 - bin1.f_error() * g_error_1;
+
+    est_dist_2 = bin2.f_add() + g_add_2 + bin2.f_rescale() * (ip2 + k1xsumq);
+    low_dist_2 = est_dist_2 - bin2.f_error() * g_error_2;
+
+    est_dist_3 = bin3.f_add() + g_add_3 + bin3.f_rescale() * (ip3 + k1xsumq);
+    low_dist_3 = est_dist_3 - bin3.f_error() * g_error_3;
+}
 
 }  // namespace rabitqlib

@@ -58,22 +58,22 @@ int main(int argc, char** argv) {
 
     std::vector<size_t> all_nprobes;
     all_nprobes.push_back(5);
-    for (size_t i = 10; i < 200; i += 10) {
+    for (size_t i = 10; i < 200; i += 20) {
         all_nprobes.push_back(i);
     }
-    for (size_t i = 200; i < 400; i += 40) {
-        all_nprobes.push_back(i);
-    }
-    for (size_t i = 400; i <= 1500; i += 100) {
-        all_nprobes.push_back(i);
-    }
-    for (size_t i = 2000; i <= 4000; i += 500) {
-        all_nprobes.push_back(i);
-    }
+    // for (size_t i = 200; i < 400; i += 40) {
+    //     all_nprobes.push_back(i);
+    // }
+    // for (size_t i = 400; i <= 1500; i += 100) {
+    //     all_nprobes.push_back(i);
+    // }
+    // for (size_t i = 2000; i <= 4000; i += 500) {
+    //     all_nprobes.push_back(i);
+    // }
 
-    all_nprobes.push_back(6000);
-    all_nprobes.push_back(10000);
-    all_nprobes.push_back(15000);
+    // all_nprobes.push_back(6000);
+    // all_nprobes.push_back(10000);
+    // all_nprobes.push_back(15000);
 
     rabitqlib::StopW stopw;
 

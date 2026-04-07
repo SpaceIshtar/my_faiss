@@ -234,6 +234,7 @@ _METHOD_NAMES = {
     "prq": "PQR",
     "lsq": "LSQ",
     "plsq": "PLSQ",
+    "turboquant": "TurboQuant",
 }
 
 

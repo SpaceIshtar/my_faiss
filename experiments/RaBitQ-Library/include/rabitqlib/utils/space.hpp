@@ -1077,6 +1077,137 @@ inline size_t popcount(const uint64_t* __restrict__ d, size_t length) {
     return ret;
 }
 
+/**
+ * @brief Batch variant of mask_ip_x0_q: compute inner products for 4 vectors simultaneously.
+ *
+ * Loads the query floats ONCE per 64-element block and applies four different binary
+ * masks (one per vector), accumulating four independent sums.  This eliminates 3/4 of
+ * the query memory traffic compared with calling mask_ip_x0_q four times in series.
+ *
+ * @param query     Rotated query vector (padded_dim floats, same for all 4 vectors)
+ * @param data0..3  Binary codes for the four database vectors (each padded_dim/64 uint64_t)
+ * @param padded_dim  Must be a multiple of 64
+ * @param r0..r3    Output: one inner-product result per vector
+ */
+inline void mask_ip_x0_q_batch_4(
+    const float* query,
+    const uint64_t* data0,
+    const uint64_t* data1,
+    const uint64_t* data2,
+    const uint64_t* data3,
+    size_t padded_dim,
+    float& r0, float& r1, float& r2, float& r3
+) {
+    const size_t num_blk = padded_dim / 64;
+
+#if defined(__AVX512F__)
+    __m512 sum0 = _mm512_setzero_ps();
+    __m512 sum1 = _mm512_setzero_ps();
+    __m512 sum2 = _mm512_setzero_ps();
+    __m512 sum3 = _mm512_setzero_ps();
+
+    for (size_t i = 0; i < num_blk; ++i) {
+        const float* qptr = query + i * 64;
+        // Load 64 query floats ONCE for this block – reused by all four bin-codes.
+        __m512 q0 = _mm512_loadu_ps(qptr);
+        __m512 q1 = _mm512_loadu_ps(qptr + 16);
+        __m512 q2 = _mm512_loadu_ps(qptr + 32);
+        __m512 q3 = _mm512_loadu_ps(qptr + 48);
+
+        // Each bin-code contributes four 16-bit masks (one per 16-float lane).
+        uint64_t b0 = reverse_bits_u64(data0[i]);
+        sum0 = _mm512_add_ps(sum0, _mm512_maskz_mov_ps(static_cast<__mmask16>(b0),       q0));
+        sum0 = _mm512_add_ps(sum0, _mm512_maskz_mov_ps(static_cast<__mmask16>(b0 >> 16), q1));
+        sum0 = _mm512_add_ps(sum0, _mm512_maskz_mov_ps(static_cast<__mmask16>(b0 >> 32), q2));
+        sum0 = _mm512_add_ps(sum0, _mm512_maskz_mov_ps(static_cast<__mmask16>(b0 >> 48), q3));
+
+        uint64_t b1 = reverse_bits_u64(data1[i]);
+        sum1 = _mm512_add_ps(sum1, _mm512_maskz_mov_ps(static_cast<__mmask16>(b1),       q0));
+        sum1 = _mm512_add_ps(sum1, _mm512_maskz_mov_ps(static_cast<__mmask16>(b1 >> 16), q1));
+        sum1 = _mm512_add_ps(sum1, _mm512_maskz_mov_ps(static_cast<__mmask16>(b1 >> 32), q2));
+        sum1 = _mm512_add_ps(sum1, _mm512_maskz_mov_ps(static_cast<__mmask16>(b1 >> 48), q3));
+
+        uint64_t b2 = reverse_bits_u64(data2[i]);
+        sum2 = _mm512_add_ps(sum2, _mm512_maskz_mov_ps(static_cast<__mmask16>(b2),       q0));
+        sum2 = _mm512_add_ps(sum2, _mm512_maskz_mov_ps(static_cast<__mmask16>(b2 >> 16), q1));
+        sum2 = _mm512_add_ps(sum2, _mm512_maskz_mov_ps(static_cast<__mmask16>(b2 >> 32), q2));
+        sum2 = _mm512_add_ps(sum2, _mm512_maskz_mov_ps(static_cast<__mmask16>(b2 >> 48), q3));
+
+        uint64_t b3 = reverse_bits_u64(data3[i]);
+        sum3 = _mm512_add_ps(sum3, _mm512_maskz_mov_ps(static_cast<__mmask16>(b3),       q0));
+        sum3 = _mm512_add_ps(sum3, _mm512_maskz_mov_ps(static_cast<__mmask16>(b3 >> 16), q1));
+        sum3 = _mm512_add_ps(sum3, _mm512_maskz_mov_ps(static_cast<__mmask16>(b3 >> 32), q2));
+        sum3 = _mm512_add_ps(sum3, _mm512_maskz_mov_ps(static_cast<__mmask16>(b3 >> 48), q3));
+    }
+
+    r0 = _mm512_reduce_add_ps(sum0);
+    r1 = _mm512_reduce_add_ps(sum1);
+    r2 = _mm512_reduce_add_ps(sum2);
+    r3 = _mm512_reduce_add_ps(sum3);
+
+#elif defined(__AVX2__)
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    __m256 sum2 = _mm256_setzero_ps();
+    __m256 sum3 = _mm256_setzero_ps();
+
+    const __m256i bit_checker =
+        _mm256_set_epi32(0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
+    const __m256i zero = _mm256_setzero_si256();
+
+    for (size_t i = 0; i < num_blk; ++i) {
+        const float* qptr = query + i * 64;
+        uint64_t b0 = reverse_bits_u64(data0[i]);
+        uint64_t b1 = reverse_bits_u64(data1[i]);
+        uint64_t b2 = reverse_bits_u64(data2[i]);
+        uint64_t b3 = reverse_bits_u64(data3[i]);
+
+        // 8 chunks of 8 floats per 64-element block.
+        for (int j = 0; j < 8; ++j) {
+            // Load 8 query floats ONCE for this byte-lane – reused by all four codes.
+            __m256 q_chunk = _mm256_loadu_ps(qptr + j * 8);
+
+            uint8_t byte0 = static_cast<uint8_t>(b0 >> (j * 8));
+            uint8_t byte1 = static_cast<uint8_t>(b1 >> (j * 8));
+            uint8_t byte2 = static_cast<uint8_t>(b2 >> (j * 8));
+            uint8_t byte3 = static_cast<uint8_t>(b3 >> (j * 8));
+
+            auto apply = [&](uint8_t byte, __m256 sum_in) -> __m256 {
+                __m256i v = _mm256_set1_epi32(byte);
+                __m256i bits = _mm256_and_si256(v, bit_checker);
+                __m256i mask = _mm256_cmpgt_epi32(bits, zero);
+                return _mm256_add_ps(sum_in, _mm256_and_ps(q_chunk, _mm256_castsi256_ps(mask)));
+            };
+
+            sum0 = apply(byte0, sum0);
+            sum1 = apply(byte1, sum1);
+            sum2 = apply(byte2, sum2);
+            sum3 = apply(byte3, sum3);
+        }
+    }
+
+    auto hsum256 = [](const __m256 v) -> float {
+        __m128 lo = _mm256_castps256_ps128(v);
+        __m128 hi = _mm256_extractf128_ps(v, 1);
+        __m128 s = _mm_add_ps(lo, hi);
+        s = _mm_hadd_ps(s, s);
+        s = _mm_hadd_ps(s, s);
+        return _mm_cvtss_f32(s);
+    };
+    r0 = hsum256(sum0);
+    r1 = hsum256(sum1);
+    r2 = hsum256(sum2);
+    r3 = hsum256(sum3);
+
+#else
+    // Scalar fallback
+    r0 = mask_ip_x0_q(query, data0, padded_dim);
+    r1 = mask_ip_x0_q(query, data1, padded_dim);
+    r2 = mask_ip_x0_q(query, data2, padded_dim);
+    r3 = mask_ip_x0_q(query, data3, padded_dim);
+#endif
+}
+
 template <typename T>
 RowMajorMatrix<T> random_gaussian_matrix(size_t rows, size_t cols) {
     RowMajorMatrix<T> rand(rows, cols);

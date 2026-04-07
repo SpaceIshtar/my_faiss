@@ -103,48 +103,54 @@ public:
     }
 
     float operator()(faiss::idx_t i) override {
-        const char* vec_data = codes_ + i * code_size_;
-        const char* bin_data = vec_data;
-        const char* ex_data = vec_data + bin_data_size_;
+        return compute_dist_(i);
+    }
 
-        // Get the centroid distance for this vector's cluster
-        uint32_t cluster_id = cluster_ids_[i];
-        float norm = q_to_centroids_[cluster_id];
-        float g_add = norm * norm;  // ||q - c||^2
-        float g_error = norm;       // ||q - c||
+    void distances_batch_4(
+            const faiss::idx_t idx0,
+            const faiss::idx_t idx1,
+            const faiss::idx_t idx2,
+            const faiss::idx_t idx3,
+            float& dis0,
+            float& dis1,
+            float& dis2,
+            float& dis3) override {
+        const char* vd0 = codes_ + idx0 * code_size_;
+        const char* vd1 = codes_ + idx1 * code_size_;
+        const char* vd2 = codes_ + idx2 * code_size_;
+        const char* vd3 = codes_ + idx3 * code_size_;
 
-        float est_dist, low_dist, ip_x0_qr;
+        float g_add_0 = q_to_centroids_[cluster_ids_[idx0]];
+        float g_add_1 = q_to_centroids_[cluster_ids_[idx1]];
+        float g_add_2 = q_to_centroids_[cluster_ids_[idx2]];
+        float g_add_3 = q_to_centroids_[cluster_ids_[idx3]];
+        // g_error = norm, g_add = norm^2
+        float ge0 = g_add_0, ge1 = g_add_1, ge2 = g_add_2, ge3 = g_add_3;
+        g_add_0 *= g_add_0;
+        g_add_1 *= g_add_1;
+        g_add_2 *= g_add_2;
+        g_add_3 *= g_add_3;
 
+        float ld0, ld1, ld2, ld3;
         if (ex_bits_ > 0) {
-            // Full estimation with extra bits
-            rabitqlib::split_single_fulldist(
-                bin_data,
-                ex_data,
-                ip_func_,
-                *query_wrapper_,
-                padded_dim_,
-                ex_bits_,
-                est_dist,
-                low_dist,
-                ip_x0_qr,
-                g_add,
-                g_error
+            rabitqlib::split_single_fulldist_4(
+                vd0, vd0 + bin_data_size_, g_add_0, ge0,
+                vd1, vd1 + bin_data_size_, g_add_1, ge1,
+                vd2, vd2 + bin_data_size_, g_add_2, ge2,
+                vd3, vd3 + bin_data_size_, g_add_3, ge3,
+                ip_func_, *query_wrapper_, padded_dim_, ex_bits_,
+                dis0, ld0, dis1, ld1, dis2, ld2, dis3, ld3
             );
         } else {
-            // 1-bit only estimation
-            rabitqlib::split_single_estdist(
-                bin_data,
-                *query_wrapper_,
-                padded_dim_,
-                ip_x0_qr,
-                est_dist,
-                low_dist,
-                g_add,
-                g_error
+            rabitqlib::split_single_estdist_4(
+                vd0, g_add_0, ge0,
+                vd1, g_add_1, ge1,
+                vd2, g_add_2, ge2,
+                vd3, g_add_3, ge3,
+                *query_wrapper_, padded_dim_,
+                dis0, ld0, dis1, ld1, dis2, ld2, dis3, ld3
             );
         }
-
-        return est_dist;
     }
 
     float symmetric_dis(faiss::idx_t i, faiss::idx_t j) override {
@@ -166,6 +172,48 @@ private:
     rabitqlib::Rotator<float>* rotator_;
     rabitqlib::quant::RabitqConfig config_;
     rabitqlib::MetricType metric_type_;
+
+    float compute_dist_(faiss::idx_t i) {
+        const char* vec_data = codes_ + i * code_size_;
+        const char* bin_data = vec_data;
+        const char* ex_data = vec_data + bin_data_size_;
+
+        uint32_t cluster_id = cluster_ids_[i];
+        float norm = q_to_centroids_[cluster_id];
+        float g_add = norm * norm;  // ||q - c||^2
+        float g_error = norm;       // ||q - c||
+
+        float est_dist, low_dist, ip_x0_qr;
+
+        if (ex_bits_ > 0) {
+            rabitqlib::split_single_fulldist(
+                bin_data,
+                ex_data,
+                ip_func_,
+                *query_wrapper_,
+                padded_dim_,
+                ex_bits_,
+                est_dist,
+                low_dist,
+                ip_x0_qr,
+                g_add,
+                g_error
+            );
+        } else {
+            rabitqlib::split_single_estdist(
+                bin_data,
+                *query_wrapper_,
+                padded_dim_,
+                ip_x0_qr,
+                est_dist,
+                low_dist,
+                g_add,
+                g_error
+            );
+        }
+
+        return est_dist;
+    }
 
     std::vector<float> rotated_query_;
     std::vector<float> q_to_centroids_;  // distance from query to each centroid
@@ -392,7 +440,7 @@ public:
         if (!ofs.is_open()) return false;
 
         uint64_t magic = 0x524142495451ULL;  // "RABITQ"
-        uint64_t version = 1;
+        uint64_t version = 2;  // v2: includes rotator state
         ofs.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
         ofs.write(reinterpret_cast<const char*>(&version), sizeof(version));
 
@@ -408,6 +456,9 @@ public:
         write_u64(bin_data_size_);
         write_u64(ex_data_size_);
         write_u64(code_size_);
+
+        // Save rotator state (FhtKacRotator::flip_ — the random signs used during rotation)
+        rotator_->save(ofs);
 
         ofs.write(codes_.data(), ntotal_ * code_size_);
         ofs.write(reinterpret_cast<const char*>(cluster_ids_.data()),
@@ -428,7 +479,7 @@ public:
         uint64_t magic, version;
         ifs.read(reinterpret_cast<char*>(&magic), sizeof(magic));
         ifs.read(reinterpret_cast<char*>(&version), sizeof(version));
-        if (magic != 0x524142495451ULL || version != 1) return false;
+        if (magic != 0x524142495451ULL || (version != 1 && version != 2)) return false;
 
         auto read_u64 = [&]() -> uint64_t {
             uint64_t v;
@@ -459,6 +510,15 @@ public:
 
         ntotal_ = ntotal;
         is_trained_ = true;
+
+        // v2+: load rotator state so the same random rotation is reproduced exactly.
+        // v1 files lack this field — those files must be regenerated.
+        if (version >= 2) {
+            rotator_->load(ifs);
+        } else {
+            std::cerr << "Warning: RaBitQ index version 1 does not store the rotator. "
+                         "Distances will be incorrect. Delete and retrain the index.\n";
+        }
 
         codes_.resize(ntotal_ * code_size_);
         ifs.read(codes_.data(), ntotal_ * code_size_);

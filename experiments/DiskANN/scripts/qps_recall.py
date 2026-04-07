@@ -25,6 +25,8 @@ ALGORITHMS = {
     "RaBitQ": "rabitq",
     "OPQ": "opq",
     "OSQ": "osq",
+    "SAQ": "saq",
+    "TurboQuant": "turboquant",
 }
 
 STYLES = {
@@ -33,6 +35,8 @@ STYLES = {
     "RaBitQ": {"color": "#2ca02c", "marker": "D", "linestyle": "-"},
     "OPQ": {"color": "#9467bd", "marker": "P", "linestyle": "-"},
     "OSQ": {"color": "#8c564b", "marker": "X", "linestyle": "-"},
+    "SAQ": {"color": "#f39c12", "marker": "8", "linestyle": "-"},
+    "TurboQuant": {"color": "#17becf", "marker": "o", "linestyle": "-"},
 }
 
 # Hardcode the search parameters you want to plot for each algorithm here.
@@ -45,6 +49,8 @@ PLOT_SEARCH_PARAMS = {
     "RaBitQ": [20,30,50,70,100,150,200,300,400],
     "OPQ": [20,30,50,70,100,150,200,300,400],
     "OSQ": [20,30,50,70,100,150,200,300,400],
+    "SAQ": [20,30,50,70,100,150,200,300,400],
+    "TurboQuant": [20,30,50,70,100,150,200,300,400],
 }
 
 

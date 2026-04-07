@@ -15,91 +15,91 @@ DiskANN + Quantization Benchmark Results
 [Summary]
        L         QPS      Recall Latency(ms)   ndis_mean  nhops_mean
 --------------------------------------------------------------------
-      10        5047      0.7742       0.198      3139.6         6.3
-      20        3908      0.8608       0.256      4105.4         8.4
-      30        3165      0.8986       0.316      5051.5        10.7
-      50        2287      0.9368       0.437      6977.9        15.3
-      70        1781      0.9555       0.561      8911.6        20.0
-     100        1338      0.9707       0.747     11803.8        27.2
-     150         945      0.9815       1.058     16549.1        39.6
-     200         724      0.9869       1.380     21231.6        51.8
-     300         493      0.9921       2.029     30402.7        76.5
-     400         368      0.9944       2.721     39397.9       101.4
+      10        5875      0.7747       0.170      3143.5         6.3
+      20        4481      0.8607       0.223      4107.5         8.4
+      30        3629      0.8988       0.276      5053.0        10.7
+      50        2605      0.9372       0.384      6977.9        15.3
+      70        2028      0.9559       0.493      8913.1        20.0
+     100        1515      0.9706       0.660     11804.5        27.2
+     150        1064      0.9815       0.940     16549.0        39.6
+     200         819      0.9869       1.222     21232.0        51.8
+     300         555      0.9921       1.803     30403.3        76.6
+     400         417      0.9944       2.398     39398.9       101.4
 
 [Detailed Statistics]
 
 --- L = 10 ---
-  QPS:          5046.96
-  Recall@10:    0.7742
-  Total Time:   7985.01 ms
-  Avg Latency:  0.1981 ms
+  QPS:          5874.61
+  Recall@10:    0.7747
+  Total Time:   6860.04 ms
+  Avg Latency:  0.1702 ms
   ndis (distance computations):
-    min:      1078.00
+    min:      1019.00
     p10:      2350.00
-    p25:      2680.00
-    p50:      3087.00
-    p75:      3527.00
-    p90:      3994.00
-    max:      8255.00
-    mean:     3139.59
-    variance: 435490.79
-    stddev:   659.92
+    p25:      2682.00
+    p50:      3089.00
+    p75:      3531.00
+    p90:      3995.00
+    max:      7589.00
+    mean:     3143.48
+    variance: 440407.87
+    stddev:   663.63
   nhops (graph hops):
-    min:      2.00
+    min:      1.00
     p10:      4.00
     p25:      5.00
     p50:      6.00
     p75:      7.00
     p90:      8.00
     max:      19.00
-    mean:     6.31
-    variance: 2.58
-    stddev:   1.61
+    mean:     6.32
+    variance: 2.61
+    stddev:   1.62
 
 --- L = 20 ---
-  QPS:          3907.97
-  Recall@10:    0.8608
-  Total Time:   10312.26 ms
-  Avg Latency:  0.2559 ms
+  QPS:          4481.23
+  Recall@10:    0.8607
+  Total Time:   8993.06 ms
+  Avg Latency:  0.2232 ms
   ndis (distance computations):
-    min:      1999.00
-    p10:      3282.00
-    p25:      3622.00
-    p50:      4024.00
-    p75:      4492.00
-    p90:      5019.00
-    max:      9632.00
-    mean:     4105.40
-    variance: 514710.24
-    stddev:   717.43
+    min:      1951.00
+    p10:      3279.00
+    p25:      3623.00
+    p50:      4023.00
+    p75:      4493.00
+    p90:      5023.00
+    max:      9591.00
+    mean:     4107.48
+    variance: 521402.08
+    stddev:   722.08
   nhops (graph hops):
-    min:      4.00
+    min:      3.00
     p10:      7.00
     p25:      7.00
     p50:      8.00
     p75:      9.00
     p90:      10.00
-    max:      22.00
-    mean:     8.39
-    variance: 2.78
-    stddev:   1.67
+    max:      21.00
+    mean:     8.40
+    variance: 2.81
+    stddev:   1.68
 
 --- L = 30 ---
-  QPS:          3165.35
-  Recall@10:    0.8986
-  Total Time:   12731.60 ms
-  Avg Latency:  0.3159 ms
+  QPS:          3629.15
+  Recall@10:    0.8988
+  Total Time:   11104.53 ms
+  Avg Latency:  0.2755 ms
   ndis (distance computations):
-    min:      2775.00
-    p10:      4217.90
-    p25:      4560.00
-    p50:      4962.00
-    p75:      5437.00
-    p90:      5976.00
-    max:      11176.00
-    mean:     5051.55
-    variance: 561431.49
-    stddev:   749.29
+    min:      2767.00
+    p10:      4218.00
+    p25:      4562.00
+    p50:      4964.00
+    p75:      5441.00
+    p90:      5973.00
+    max:      11175.00
+    mean:     5052.99
+    variance: 563150.04
+    stddev:   750.43
   nhops (graph hops):
     min:      6.00
     p10:      9.00
@@ -107,27 +107,27 @@ DiskANN + Quantization Benchmark Results
     p50:      10.00
     p75:      11.00
     p90:      13.00
-    max:      26.00
-    mean:     10.65
-    variance: 2.72
+    max:      25.00
+    mean:     10.66
+    variance: 2.71
     stddev:   1.65
 
 --- L = 50 ---
-  QPS:          2287.11
-  Recall@10:    0.9368
-  Total Time:   17620.46 ms
-  Avg Latency:  0.4372 ms
+  QPS:          2605.43
+  Recall@10:    0.9372
+  Total Time:   15467.70 ms
+  Avg Latency:  0.3838 ms
   ndis (distance computations):
-    min:      4185.00
-    p10:      6053.90
-    p25:      6469.00
-    p50:      6916.00
-    p75:      7410.00
-    p90:      7951.00
-    max:      14822.00
-    mean:     6977.93
-    variance: 657818.43
-    stddev:   811.06
+    min:      4187.00
+    p10:      6054.00
+    p25:      6468.00
+    p50:      6911.00
+    p75:      7406.00
+    p90:      7956.00
+    max:      15248.00
+    mean:     6977.94
+    variance: 661009.85
+    stddev:   813.03
   nhops (graph hops):
     min:      10.00
     p10:      14.00
@@ -137,25 +137,25 @@ DiskANN + Quantization Benchmark Results
     p90:      17.00
     max:      33.00
     mean:     15.28
-    variance: 2.50
-    stddev:   1.58
+    variance: 2.51
+    stddev:   1.59
 
 --- L = 70 ---
-  QPS:          1781.14
-  Recall@10:    0.9555
-  Total Time:   22626.00 ms
-  Avg Latency:  0.5614 ms
+  QPS:          2028.19
+  Recall@10:    0.9559
+  Total Time:   19869.97 ms
+  Avg Latency:  0.4931 ms
   ndis (distance computations):
-    min:      5527.00
-    p10:      7813.00
-    p25:      8359.75
+    min:      5535.00
+    p10:      7814.00
+    p25:      8358.00
     p50:      8894.00
-    p75:      9425.00
-    p90:      9986.00
-    max:      16944.00
-    mean:     8911.63
-    variance: 824908.15
-    stddev:   908.24
+    p75:      9424.00
+    p90:      9984.00
+    max:      17634.00
+    mean:     8913.15
+    variance: 834572.08
+    stddev:   913.55
   nhops (graph hops):
     min:      15.00
     p10:      18.00
@@ -163,85 +163,85 @@ DiskANN + Quantization Benchmark Results
     p50:      20.00
     p75:      21.00
     p90:      22.00
-    max:      36.00
+    max:      40.00
     mean:     20.04
-    variance: 2.30
-    stddev:   1.52
+    variance: 2.35
+    stddev:   1.53
 
 --- L = 100 ---
-  QPS:          1338.03
-  Recall@10:    0.9707
-  Total Time:   30118.91 ms
-  Avg Latency:  0.7474 ms
+  QPS:          1515.23
+  Recall@10:    0.9706
+  Total Time:   26596.63 ms
+  Avg Latency:  0.6600 ms
   ndis (distance computations):
-    min:      7487.00
-    p10:      10370.00
-    p25:      11138.75
-    p50:      11853.00
-    p75:      12504.00
-    p90:      13109.00
-    max:      21572.00
-    mean:     11803.82
-    variance: 1242504.64
-    stddev:   1114.68
+    min:      7481.00
+    p10:      10373.00
+    p25:      11137.00
+    p50:      11851.00
+    p75:      12503.00
+    p90:      13111.00
+    max:      21692.00
+    mean:     11804.46
+    variance: 1241944.86
+    stddev:   1114.43
   nhops (graph hops):
-    min:      22.00
+    min:      21.00
     p10:      26.00
     p25:      26.00
     p50:      27.00
     p75:      28.00
     p90:      29.00
-    max:      50.00
+    max:      52.00
     mean:     27.19
     variance: 2.18
     stddev:   1.48
 
 --- L = 150 ---
-  QPS:          945.16
+  QPS:          1064.23
   Recall@10:    0.9815
-  Total Time:   42638.20 ms
-  Avg Latency:  1.0580 ms
+  Total Time:   37867.82 ms
+  Avg Latency:  0.9396 ms
   ndis (distance computations):
-    min:      10763.00
-    p10:      14485.00
-    p25:      15625.00
-    p50:      16672.00
-    p75:      17583.00
-    p90:      18355.00
-    max:      28868.00
-    mean:     16549.12
-    variance: 2319800.60
-    stddev:   1523.09
+    min:      10764.00
+    p10:      14492.90
+    p25:      15620.75
+    p50:      16677.00
+    p75:      17589.00
+    p90:      18351.00
+    max:      25919.00
+    mean:     16548.96
+    variance: 2311981.98
+    stddev:   1520.52
   nhops (graph hops):
-    min:      34.00
+    min:      33.00
     p10:      38.00
     p25:      39.00
     p50:      39.00
     p75:      40.00
     p90:      41.00
-    max:      66.00
-    mean:     39.58
-    variance: 1.94
+    max:      64.00
+    mean:     39.57
+    variance: 1.92
     stddev:   1.39
 
 --- L = 200 ---
-  QPS:          724.43
+  QPS:          818.56
   Recall@10:    0.9869
-  Total Time:   55630.03 ms
-  Avg Latency:  1.3804 ms
+  Total Time:   49233.05 ms
+  Avg Latency:  1.2217 ms
   ndis (distance computations):
-    min:      14106.00
-    p10:      18541.90
-    p25:      20017.00
-    p50:      21410.50
-    p75:      22615.25
-    p90:      23590.00
-    max:      33599.00
-    mean:     21231.60
-    variance: 3837723.77
-    stddev:   1959.01
+    min:      14096.00
+    p10:      18538.00
+    p25:      20014.00
+    p50:      21408.00
+    p75:      22620.00
+    p90:      23589.00
+    max:      33482.00
+    mean:     21232.00
+    variance: 3843322.70
+    stddev:   1960.44
   nhops (graph hops):
-    min:      46.00
+    min:      45.00
     p10:      50.00
     p25:      51.00
     p50:      52.00
@@ -249,63 +249,63 @@ DiskANN + Quantization Benchmark Results
     p90:      53.00
     max:      77.00
     mean:     51.78
-    variance: 2.12
+    variance: 2.13
     stddev:   1.46
 
 --- L = 300 ---
-  QPS:          492.75
+  QPS:          554.71
   Recall@10:    0.9921
-  Total Time:   81786.05 ms
-  Avg Latency:  2.0294 ms
+  Total Time:   72650.67 ms
+  Avg Latency:  1.8027 ms
   ndis (distance computations):
-    min:      20882.00
-    p10:      26461.90
-    p25:      28568.00
-    p50:      30656.00
-    p75:      32474.25
-    p90:      33908.00
-    max:      40300.00
-    mean:     30402.71
-    variance: 8180937.51
-    stddev:   2860.23
+    min:      20895.00
+    p10:      26454.00
+    p25:      28567.75
+    p50:      30649.00
+    p75:      32487.00
+    p90:      33909.00
+    max:      40113.00
+    mean:     30403.29
+    variance: 8179077.39
+    stddev:   2859.91
   nhops (graph hops):
-    min:      70.00
+    min:      69.00
     p10:      75.00
     p25:      76.00
     p50:      76.00
     p75:      77.00
     p90:      78.00
-    max:      100.00
+    max:      101.00
     mean:     76.55
-    variance: 1.74
+    variance: 1.75
     stddev:   1.32
 
 --- L = 400 ---
-  QPS:          367.57
+  QPS:          416.95
   Recall@10:    0.9944
-  Total Time:   109640.43 ms
-  Avg Latency:  2.7206 ms
+  Total Time:   96654.59 ms
+  Avg Latency:  2.3984 ms
   ndis (distance computations):
-    min:      27522.00
-    p10:      34258.00
-    p25:      36936.00
-    p50:      39693.50
-    p75:      42130.00
-    p90:      44027.00
-    max:      51190.00
-    mean:     39397.85
-    variance: 13972077.24
-    stddev:   3737.92
+    min:      27520.00
+    p10:      34252.90
+    p25:      36933.00
+    p50:      39699.50
+    p75:      42133.00
+    p90:      44036.00
+    max:      49982.00
+    mean:     39398.87
+    variance: 13976350.25
+    stddev:   3738.50
   nhops (graph hops):
-    min:      94.00
+    min:      93.00
     p10:      100.00
     p25:      101.00
     p50:      101.00
     p75:      102.00
     p90:      103.00
     max:      125.00
-    mean:     101.41
-    variance: 1.66
+    mean:     101.40
+    variance: 1.65
     stddev:   1.29
 
 ========================================

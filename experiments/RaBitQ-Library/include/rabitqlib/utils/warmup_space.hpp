@@ -232,3 +232,58 @@ inline float warmup_ip_x0_q(
 
     return (delta * static_cast<float>(ip)) + (vl * static_cast<float>(ppc));
 }
+
+/**
+ * @brief Batch variant of warmup_ip_x0_q: compute the 1-bit inner products for 4 vectors
+ * simultaneously, loading each query word ONCE and reusing it across all four data words.
+ *
+ * @tparam b_query  Number of query bits (compile-time constant, typically 4 = kNumBits)
+ * @param data0..3  Pointer to binary codes for the four database vectors
+ * @param query     Packed query binary representation (num_blk * b_query uint64_t words)
+ * @param delta, vl Quantisation parameters (same for all vectors)
+ * @param padded_dim  Must be a multiple of 64
+ * @param r0..r3    Output ip_x0_qr values (one per vector)
+ */
+template <uint32_t b_query>
+inline void warmup_ip_x0_q_batch_4(
+    const uint64_t* data0,
+    const uint64_t* data1,
+    const uint64_t* data2,
+    const uint64_t* data3,
+    const uint64_t* query,
+    float delta,
+    float vl,
+    size_t padded_dim,
+    float& r0, float& r1, float& r2, float& r3
+) {
+    const size_t num_blk = padded_dim / 64;
+
+    size_t ip0 = 0, ip1 = 0, ip2 = 0, ip3 = 0;
+    size_t ppc0 = 0, ppc1 = 0, ppc2 = 0, ppc3 = 0;
+
+    for (size_t i = 0; i < num_blk; ++i) {
+        const uint64_t x0 = data0[i];
+        const uint64_t x1 = data1[i];
+        const uint64_t x2 = data2[i];
+        const uint64_t x3 = data3[i];
+
+        ppc0 += __builtin_popcountll(x0);
+        ppc1 += __builtin_popcountll(x1);
+        ppc2 += __builtin_popcountll(x2);
+        ppc3 += __builtin_popcountll(x3);
+
+        // Load each query word ONCE and AND against all four data words.
+        for (uint32_t j = 0; j < b_query; ++j) {
+            const uint64_t y = query[i * b_query + j];  // loaded once, reused 4×
+            ip0 += __builtin_popcountll(x0 & y) << j;
+            ip1 += __builtin_popcountll(x1 & y) << j;
+            ip2 += __builtin_popcountll(x2 & y) << j;
+            ip3 += __builtin_popcountll(x3 & y) << j;
+        }
+    }
+
+    r0 = delta * static_cast<float>(ip0) + vl * static_cast<float>(ppc0);
+    r1 = delta * static_cast<float>(ip1) + vl * static_cast<float>(ppc1);
+    r2 = delta * static_cast<float>(ip2) + vl * static_cast<float>(ppc2);
+    r3 = delta * static_cast<float>(ip3) + vl * static_cast<float>(ppc3);
+}

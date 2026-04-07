@@ -16,7 +16,7 @@
  *
  * Options:
  *   --dataset <name>           Dataset name (e.g., sift1M)
- *   --algorithm <name>         Algorithm name (pq, sq, opq, osq, rq, lsq, prq, plsq, vaq, rabitq)
+ *   --algorithm <name>         Algorithm name (pq, sq, opq, osq, rq, lsq, prq, plsq, vaq, rabitq, saq, turboquant)
  *   --config-dir <path>        Config directory (default: ./config)
  *   --algo-config-dir <path>   Algorithm config directory (default: config-dir)
  *   --data-path <path>         Override dataset base path
@@ -65,6 +65,7 @@
 #include "../hnsw/include/rabitq_wrapper.h"
 #include "../hnsw/include/saq_wrapper.h"
 #include "../hnsw/include/sq_wrapper.h"
+#include "../hnsw/include/turboquant_wrapper.h"
 #include "../hnsw/include/vaq_wrapper.h"
 
 // Shared utilities (Timer, fvecs_read, etc.)
@@ -534,6 +535,8 @@ std::unique_ptr<QuantWrapper> create_wrapper(
         return create_rabitq_wrapper(d, metric, params);
     } else if (algorithm == "saq") {
         return create_saq_wrapper(d, metric, params);
+    } else if (algorithm == "turboquant") {
+        return create_turboquant_wrapper(d, metric, params);
     } else {
         throw std::runtime_error("Unknown algorithm: " + algorithm);
     }
@@ -559,7 +562,7 @@ void print_usage(const char* prog) {
     std::cout << "Usage: " << prog << " --dataset <name> --algorithm <name> [options]\n\n"
               << "Options:\n"
               << "  --dataset <name>           Dataset name (e.g., sift1M)\n"
-              << "  --algorithm <name>         Algorithm (pq, opq, osq, sq, rq, lsq, prq, plsq, vaq, rabitq, saq)\n"
+              << "  --algorithm <name>         Algorithm (pq, opq, osq, sq, rq, lsq, prq, plsq, vaq, rabitq, saq, turboquant)\n"
               << "  --config-dir <path>        Config directory (default: ./config)\n"
               << "  --algo-config-dir <path>   Algorithm config directory (default: config-dir)\n"
               << "  --data-path <path>         Override dataset base path\n"
@@ -714,6 +717,10 @@ int main(int argc, char** argv) {
             param_sets.push_back({.params = {{"bits", "1"}, {"clusters", "4096"}}});
             param_sets.push_back({.params = {{"bits", "2"}, {"clusters", "4096"}}});
             param_sets.push_back({.params = {{"bits", "4"}, {"clusters", "4096"}}});
+        } else if (opts.algorithm == "turboquant") {
+            param_sets.push_back({.params = {{"bits", "2"}, {"seed", "1234"}}});
+            param_sets.push_back({.params = {{"bits", "3"}, {"seed", "1234"}}});
+            param_sets.push_back({.params = {{"bits", "4"}, {"seed", "1234"}}});
         }
     }
 

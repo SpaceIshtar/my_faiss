@@ -143,9 +143,18 @@ class SaqCluEstimator : public SaqEstimatorBase<CaqCluEstimator<kDistType>> {
      * efficient parallel processing.
      *
      * @param block_idx Index of the block to process (each block contains 32 vectors)
-     * @param fst_distances Output array of 2 __m512 vectors containing distance estimates
+     * @param fst_distances Output array of 2 __m512 vectors containing distance
+     * estimates. Can be nullptr when callers only need the per-block side effects
+     * required by compAccurateDist().
      */
     void compFastDist(size_t block_idx, __m512 *fst_distances) {
+        if (fst_distances == nullptr) {
+            for (size_t c_i = 0; c_i < estimators_.size(); ++c_i) {
+                estimators_[c_i].compFastDist(block_idx, nullptr);
+            }
+            return;
+        }
+
         fst_distances[0] = _mm512_setzero_ps();
         fst_distances[1] = _mm512_setzero_ps();
         __m512 cd[2];

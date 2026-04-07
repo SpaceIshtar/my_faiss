@@ -77,7 +77,6 @@ target_link_libraries(bench_hnswpq PRIVATE faiss_avx512 OpenMP::OpenMP_CXX)
 # ============================================================
 add_executable(bench_hnsw_quant EXCLUDE_FROM_ALL bench_hnsw_quant.cpp)
 target_sources(bench_hnsw_quant PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/turboquant_wrapper.cpp
     ${OSQ_DIR}/OptimizedScalarQuantizer.cpp
     ${OSQ_DIR}/OSQIndex.cpp
 )
@@ -92,7 +91,7 @@ target_include_directories(bench_hnsw_quant PRIVATE
 )
 target_link_libraries(bench_hnsw_quant PRIVATE faiss_avx512 -lglpk -larmadillo OpenMP::OpenMP_CXX)
 target_compile_options(bench_hnsw_quant PRIVATE -march=native -mfma)
-target_compile_definitions(bench_hnsw_quant PRIVATE VAQ_OPTIMIZE EIGEN_DONT_PARALLELIZE)
+target_compile_definitions(bench_hnsw_quant PRIVATE VAQ_OPTIMIZE EIGEN_DONT_PARALLELIZE TURBOQUANT_HAS_FAISS_DISTANCE_COMPUTER)
 
 # ============================================================
 # Cache profiling tool (train/profile modes for cachegrind)

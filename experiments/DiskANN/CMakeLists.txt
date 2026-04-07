@@ -169,7 +169,7 @@ target_include_directories(bench_diskann_quant PRIVATE
     ${VAQ_INCLUDE_DIR}
     ${VAQ_EIGEN_DIR}
 )
-target_compile_definitions(bench_diskann_quant PRIVATE ${DISKANN_COMPILE_DEFS} VAQ_OPTIMIZE EIGEN_DONT_PARALLELIZE)
+target_compile_definitions(bench_diskann_quant PRIVATE ${DISKANN_COMPILE_DEFS} VAQ_OPTIMIZE EIGEN_DONT_PARALLELIZE TURBOQUANT_HAS_FAISS_DISTANCE_COMPUTER)
 # Keep the benchmark on the host's full ISA. Adding explicit -mavx2 here can
 # downgrade OSQ source files and disable AVX-512 / VPOPCNT paths even though
 # the machine and linked Faiss variant support them.

@@ -942,30 +942,13 @@ int main(int argc, char** argv) {
             std::cerr << "clusters needed to be set in conf" << std::endl;
             exit(-1);
         }
-        // Build or load RaBitQ index
+        // Build RaBitQ index
         RaBitQIndex rabitq(d, total_bits, num_clusters);
-        std::string rabitq_path = RaBitQIndex::get_index_path(
-            ds_cfg.base_path, total_bits, num_clusters);
-
-        if (rabitq.load(rabitq_path)) {
-            std::cout << "\n[Loaded RaBitQ index from " << rabitq_path << "]" << std::endl;
-            std::cout << "  ntotal=" << rabitq.get_ntotal() << std::endl;
-        } else {
-            std::cout << "\n[Building RaBitQ index (bits=" << total_bits
-                      << ", ncluster=" << num_clusters << ")...]" << std::endl;
-            Timer timer;
-            rabitq.add(nb, xb);
-            std::cout << "RaBitQ build time: " << timer.elapsed_ms() << " ms" << std::endl;
-
-            // Save for future runs
-            size_t last_slash = rabitq_path.rfind('/');
-            if (last_slash != std::string::npos) {
-                create_directory(rabitq_path.substr(0, last_slash));
-            }
-            if (rabitq.save(rabitq_path)) {
-                std::cout << "Saved RaBitQ index to: " << rabitq_path << std::endl;
-            }
-        }
+        std::cout << "\n[Building RaBitQ index (bits=" << total_bits
+                  << ", ncluster=" << num_clusters << ")...]" << std::endl;
+        Timer build_timer;
+        rabitq.add(nb, xb);
+        std::cout << "RaBitQ build time: " << build_timer.elapsed_ms() << " ms" << std::endl;
 
         // Run benchmark
         std::cout << "\n" << std::setw(8) << "ef"
