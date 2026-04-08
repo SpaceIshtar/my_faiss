@@ -30,27 +30,23 @@ ALGORITHMS = {
 }
 
 STYLES = {
-    "PQ": {"color": "#1f77b4", "marker": "s", "linestyle": "-"},
-    "SQ": {"color": "#ff7f0e", "marker": "^", "linestyle": "-"},
-    "RaBitQ": {"color": "#2ca02c", "marker": "D", "linestyle": "-"},
-    "OPQ": {"color": "#9467bd", "marker": "P", "linestyle": "-"},
-    "OSQ": {"color": "#8c564b", "marker": "X", "linestyle": "-"},
-    "SAQ": {"color": "#f39c12", "marker": "8", "linestyle": "-"},
-    "TurboQuant": {"color": "#00acc1", "marker": "H", "linestyle": "-"},
+    "PQ":         {"color": "#1f77b4", "marker": "s",  "linestyle": "-"},
+    "SQ":         {"color": "#ff7f0e", "marker": "^",  "linestyle": "-"},
+    "RaBitQ":     {"color": "#2ca02c", "marker": "D",  "linestyle": "-"},
+    "OPQ":        {"color": "#9467bd", "marker": "P",  "linestyle": "-"},
+    "OSQ":        {"color": "#8c564b", "marker": "X",  "linestyle": "-"},
+    "SAQ":        {"color": "#f39c12", "marker": "8",  "linestyle": "-"},
+    "TurboQuant": {"color": "#00acc1", "marker": "H",  "linestyle": "-"},
 }
 
-# Hardcode the search parameters you want to plot for each algorithm here.
-# Use None to keep all points from the selected config.
-# DiskANN result files use L as the search parameter, which plays the role
-# of the search-time knob similarly to ef in HNSW.
 PLOT_SEARCH_PARAMS = {
-    "PQ": [20,30,50,70,100,150,200,300,400],
-    "SQ": [20,30,50,70,100,150,200,300,400],
-    "RaBitQ": [20,30,50,70,100,150,200,300,400],
-    "OPQ": [20,30,50,70,100,150,200,300,400],
-    "OSQ": [20,30,50,70,100,150,200,300,400],
-    "SAQ": [20,30,50,70,100,150,200,300,400],
-    "TurboQuant": [20,30,50,70,100,150,200,300,400],
+    "PQ":         [20, 30, 50, 70, 100, 150, 200, 300, 400],
+    "SQ":         [20, 30, 50, 70, 100, 150, 200, 300, 400],
+    "RaBitQ":     [20, 30, 50, 70, 100, 150, 200, 300, 400],
+    "OPQ":        [20, 30, 50, 70, 100, 150, 200, 300, 400],
+    "OSQ":        [20, 30, 50, 70, 100, 150, 200, 300, 400],
+    "SAQ":        [20, 30, 50, 70, 100, 150, 200, 300, 400],
+    "TurboQuant": [20, 30, 50, 70, 100, 150, 200, 300, 400],
 }
 
 
@@ -59,12 +55,13 @@ def parse_args() -> argparse.Namespace:
     default_results_dir = os.path.join(script_dir, "..", "results")
     default_figures_root = os.path.join(script_dir, "..", "figures")
 
-    parser = argparse.ArgumentParser(description="Plot DiskANN QPS-recall curves.")
+    parser = argparse.ArgumentParser(description="Plot DiskANN nhops vs recall curves.")
     parser.add_argument("--dataset", default="bigann", help="Dataset name under experiments/DiskANN/results.")
     parser.add_argument("--target-recall", type=float, default=0.95, help="Recall threshold for selecting the best config.")
+    parser.add_argument("--recall-threshold", type=float, default=0.85, help="Points with recall below this value are not plotted.")
     parser.add_argument("--results-dir", default=default_results_dir, help="Root directory containing DiskANN result folders.")
     parser.add_argument("--figures-dir", default=default_figures_root, help="Root directory where figures and legends will be saved.")
-    parser.add_argument("--output-name", default=None, help="Optional output filename. Defaults to <dataset>_qps_recall_<target>.pdf")
+    parser.add_argument("--output-name", default=None, help="Optional output filename. Defaults to <dataset>_nhops_recall_<target>.pdf")
     return parser.parse_args()
 
 
@@ -72,7 +69,6 @@ def filter_entries_for_plot(algo_name: str, entries: list):
     selected_params = PLOT_SEARCH_PARAMS.get(algo_name)
     if selected_params is None:
         return entries
-
     selected_param_set = set(selected_params)
     return [entry for entry in entries if entry.search_param in selected_param_set]
 
@@ -86,7 +82,7 @@ def main() -> None:
     os.makedirs(legends_dir, exist_ok=True)
 
     if args.output_name is None:
-        output_name = f"{args.dataset}_qps_recall_{args.target_recall:.2f}.pdf"
+        output_name = f"{args.dataset}_nhops_recall_{args.target_recall:.2f}.pdf"
     else:
         output_name = args.output_name
 
@@ -106,18 +102,19 @@ def main() -> None:
 
         entries = sorted(best.entries, key=lambda entry: entry.recall)
         entries = filter_entries_for_plot(algo_name, entries)
+        entries = [e for e in entries if e.recall >= args.recall_threshold and e.nhops is not None]
         if not entries:
-            print(f"[SKIP] {algo_name}: no entries left after applying PLOT_SEARCH_PARAMS")
+            print(f"[SKIP] {algo_name}: no entries with nhops data above recall threshold")
             continue
 
         recalls = [entry.recall for entry in entries]
-        qps_vals = [entry.qps for entry in entries]
+        nhops_vals = [entry.nhops for entry in entries]
         plotted_params = [entry.search_param for entry in entries]
 
         style = STYLES.get(algo_name, {"color": "gray", "marker": ".", "linestyle": "-"})
         line, = ax.plot(
             recalls,
-            qps_vals,
+            nhops_vals,
             marker=style["marker"],
             color=style["color"],
             linestyle=style["linestyle"],
@@ -132,7 +129,7 @@ def main() -> None:
         )
 
     ax.set_xlabel("Recall@10")
-    ax.set_ylabel("QPS")
+    ax.set_ylabel("Number of Hops")
     ax.set_yscale("log")
     ax.grid(True, which="both", linestyle="--", alpha=0.5)
 
@@ -143,7 +140,13 @@ def main() -> None:
 
     if legend_handles:
         fig_leg = plt.figure()
-        legend = fig_leg.legend(handles=legend_handles, loc="center", ncol=min(len(legend_handles), 7), frameon=False, fontsize=12)
+        legend = fig_leg.legend(
+            handles=legend_handles,
+            loc="center",
+            ncol=min(len(legend_handles), 7),
+            frameon=False,
+            fontsize=12,
+        )
         fig_leg.canvas.draw()
         bbox = legend.get_window_extent().transformed(fig_leg.dpi_scale_trans.inverted())
         legend_path = os.path.join(legends_dir, output_name)

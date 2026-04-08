@@ -26,7 +26,8 @@ ALGORITHMS = {
     "RaBitQ": "rabitq",
     "RaBitQ-Native": "rabitq_native",
     "OPQ": "opq",
-    "VAQ": "vaq", 
+    "OSQ": "osq",
+    "VAQ": "vaq",
     "RQ": "rq",
     "PQR": "prq",
     "LSQ": "lsq",
@@ -34,8 +35,9 @@ ALGORITHMS = {
     "SAQ": "saq",
     "TurboQuant": "turboquant",
 }
-TARGET_RECALL = 0.90
-NAME = "sift1M_qps_recall_0.90.pdf"
+TARGET_RECALL = 0.95
+RECALL_THRESHOLD = 0.90  # points with recall < this value are not plotted
+NAME = "sift1M_qps_recall_0.95.pdf"
 
 # ── Paths ──────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -56,7 +58,8 @@ STYLES = {
     "RaBitQ":       {"color": "#2ca02c", "marker": "D",  "linestyle": "-"},
     "RaBitQ-Native":{"color": "#d62728", "marker": "v",  "linestyle": "-"},
     "OPQ":          {"color": "#9467bd", "marker": "P",  "linestyle": "-"},
-    "VAQ":          {"color": "#8c564b", "marker": "X",  "linestyle": "-"},
+    "OSQ":          {"color": "#8c564b", "marker": "X",  "linestyle": "-"},
+    "VAQ":          {"color": "#a04000", "marker": "1",  "linestyle": "-"},
     "RQ":           {"color": "#e377c2", "marker": "h",  "linestyle": "-"},
     "PQR":          {"color": "#7f7f7f", "marker": "*",  "linestyle": "-"},
     "LSQ":          {"color": "#bcbd22", "marker": "p",  "linestyle": "-"},
@@ -83,6 +86,7 @@ for algo_name, algo_folder in ALGORITHMS.items():
         continue
 
     entries = sorted(best.entries, key=lambda e: e.recall)
+    entries = [e for e in entries if e.recall >= RECALL_THRESHOLD]
     recalls = [e.recall for e in entries]
     qps_vals = [e.qps for e in entries]
 
@@ -114,6 +118,7 @@ for name, path, loader in external_results:
         continue
 
     entries = sorted(rf.entries, key=lambda e: e.recall)
+    entries = [e for e in entries if e.recall >= RECALL_THRESHOLD]
     recalls = [e.recall for e in entries]
     qps_vals = [e.qps for e in entries]
 
@@ -148,7 +153,7 @@ if legend_handles:
     legend = fig_leg.legend(
         handles=legend_handles,
         loc="center",
-        ncol=7,
+        ncol=5,
         frameon=False,
         fontsize=12,
     )
