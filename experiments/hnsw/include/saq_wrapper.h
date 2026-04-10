@@ -137,6 +137,16 @@ class SAQDistanceComputer : public faiss::DistanceComputer {
 
     float operator()(faiss::idx_t i) override;
 
+    void distances_batch_4(
+            const faiss::idx_t idx0,
+            const faiss::idx_t idx1,
+            const faiss::idx_t idx2,
+            const faiss::idx_t idx3,
+            float& dis0,
+            float& dis1,
+            float& dis2,
+            float& dis3) override;
+
     float symmetric_dis(faiss::idx_t /*i*/, faiss::idx_t /*j*/) override {
         throw std::runtime_error("SAQDistanceComputer::symmetric_dis not implemented");
     }
@@ -827,6 +837,146 @@ inline float SAQDistanceComputer::operator()(faiss::idx_t i) {
         return std::numeric_limits<float>::infinity();
     }
     return dist;
+}
+
+inline void SAQDistanceComputer::distances_batch_4(
+        const faiss::idx_t idx0,
+        const faiss::idx_t idx1,
+        const faiss::idx_t idx2,
+        const faiss::idx_t idx3,
+        float& dis0,
+        float& dis1,
+        float& dis2,
+        float& dis3) {
+    // Fall back to sequential if not using fastscan path
+    if (!use_fastscan_path_) {
+        dis0 = (*this)(idx0); dis1 = (*this)(idx1);
+        dis2 = (*this)(idx2); dis3 = (*this)(idx3);
+        return;
+    }
+
+    constexpr int N = 4;
+    const faiss::idx_t idxs[N] = {idx0, idx1, idx2, idx3};
+
+    uint32_t cids[N], offs[N], blks[N];
+    for (int i = 0; i < N; i++) {
+        cids[i] = parent_->vector_cluster_ids_[idxs[i]];
+        offs[i] = parent_->vector_offsets_[idxs[i]];
+        blks[i] = offs[i] / saqlib::KFastScanSize;
+        if (cids[i] >= parent_->clusters_.size() ||
+            offs[i] >= parent_->clusters_[cids[i]]->num_vec_) {
+            dis0 = (*this)(idx0); dis1 = (*this)(idx1);
+            dis2 = (*this)(idx2); dis3 = (*this)(idx3);
+            return;
+        }
+    }
+
+    const size_t n_segs = fast_estimator_->getEstimators().size();
+    // Stack storage (supports up to 8 segments; fall back if more)
+    constexpr size_t kMaxSegs = 8;
+    if (n_segs > kMaxSegs) {
+        dis0 = (*this)(idx0); dis1 = (*this)(idx1);
+        dis2 = (*this)(idx2); dis3 = (*this)(idx3);
+        return;
+    }
+
+    // Phase 1: Prepare each cluster+block sequentially, save per-segment data.
+    // Key insight: after our LUT optimization, the Lut (IP_FUNC + query_) is shared
+    // across all clusters. We only need to save the cluster-specific values before
+    // switching to the next cluster.
+    float saved_ip_xbq[N][kMaxSegs] = {};
+    float saved_q_l2sqr[N][kMaxSegs] = {};
+    float saved_cent_corr[N][kMaxSegs] = {};
+
+    if (use_cluster_cache_) {
+        for (int i = 0; i < N; i++) {
+            auto& state = cluster_cache_[cids[i]];
+            if (state.generation != query_generation_) {
+                state.fast_estimator =
+                        std::make_unique<FastEstimator>(*fast_estimator_);
+                state.fast_estimator->prepare(parent_->clusters_[cids[i]].get());
+                state.generation = query_generation_;
+                state.prepared_block = std::numeric_limits<uint32_t>::max();
+            }
+            if (blks[i] != state.prepared_block) {
+                state.fast_estimator->compFastDist(blks[i], nullptr);
+                state.prepared_block = blks[i];
+            }
+            for (size_t s = 0; s < n_segs; s++) {
+                auto& est = state.fast_estimator->getEstimators()[s];
+                saved_ip_xbq[i][s] =
+                        est.getLut().getIPXBQPrime(offs[i] % saqlib::KFastScanSize);
+                saved_q_l2sqr[i][s] = est.getQl2sqr();
+                saved_cent_corr[i][s] = est.getCentCorrection(offs[i]);
+            }
+        }
+    } else {
+        for (int i = 0; i < N; i++) {
+            if (cids[i] != prepared_cluster_) {
+                fast_estimator_->prepare(parent_->clusters_[cids[i]].get());
+                prepared_cluster_ = cids[i];
+                prepared_block_ = std::numeric_limits<uint32_t>::max();
+            }
+            if (blks[i] != prepared_block_) {
+                fast_estimator_->compFastDist(blks[i], nullptr);
+                prepared_block_ = blks[i];
+            }
+            // Save before this cluster's state is overwritten by next iteration
+            for (size_t s = 0; s < n_segs; s++) {
+                auto& est = fast_estimator_->getEstimators()[s];
+                saved_ip_xbq[i][s] =
+                        est.getLut().getIPXBQPrime(offs[i] % saqlib::KFastScanSize);
+                saved_q_l2sqr[i][s] = est.getQl2sqr();
+                saved_cent_corr[i][s] = est.getCentCorrection(offs[i]);
+            }
+        }
+    }
+
+    // Phase 2: Per-segment batch IP + combine.
+    // fast_estimator_->getEstimators()[s].getLut() has the correct IP_FUNC_4 and
+    // query_ for segment s (these are query-derived, not cluster-specific).
+    float dis[N] = {};
+    for (size_t s = 0; s < n_segs; s++) {
+        // Gather per-vector cluster data for segment s
+        const uint8_t* long_codes[N];
+        float rescales[N], o_l2norms[N];
+        for (int i = 0; i < N; i++) {
+            const auto& seg = parent_->clusters_[cids[i]]->get_segment(s);
+            long_codes[i] = seg.long_code(offs[i]);
+            rescales[i] = seg.long_factor(offs[i]).rescale;
+            o_l2norms[i] = seg.factor_o_l2norm(blks[i])[offs[i] % saqlib::KFastScanSize];
+        }
+
+        // 4-way raw IP: query loaded once, applied to 4 different long codes
+        float raw[N];
+        fast_estimator_->getEstimators()[s].getLut().computeRawIPs_4(
+                long_codes[0], long_codes[1], long_codes[2], long_codes[3],
+                raw[0], raw[1], raw[2], raw[3]);
+
+        const float sq_delta = fast_estimator_->getEstimators()[s].getSqDelta();
+        const float sum_q =
+                fast_estimator_->getEstimators()[s].getLut().getSumQ();
+
+        for (int i = 0; i < N; i++) {
+            // Reconstruct ext_ip from saved ip_xb_qprime and new raw IP
+            float ext_ip =
+                    saved_ip_xbq[i][s] + raw[i] * sq_delta +
+                    (-1.0f + sq_delta * 0.5f) * sum_q;
+            float ip_o_q = rescales[i] * ext_ip;
+            float o_l2sqr = o_l2norms[i] * o_l2norms[i];
+            dis[i] += o_l2sqr + saved_q_l2sqr[i][s] - 2.0f * ip_o_q +
+                    saved_cent_corr[i][s];
+        }
+    }
+
+    dis0 = std::isfinite(dis[0]) ? std::max(0.0f, dis[0])
+                                 : std::numeric_limits<float>::infinity();
+    dis1 = std::isfinite(dis[1]) ? std::max(0.0f, dis[1])
+                                 : std::numeric_limits<float>::infinity();
+    dis2 = std::isfinite(dis[2]) ? std::max(0.0f, dis[2])
+                                 : std::numeric_limits<float>::infinity();
+    dis3 = std::isfinite(dis[3]) ? std::max(0.0f, dis[3])
+                                 : std::numeric_limits<float>::infinity();
 }
 
 inline bool parse_saq_bool(const std::string& v) {

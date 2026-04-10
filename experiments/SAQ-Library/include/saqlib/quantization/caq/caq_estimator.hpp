@@ -39,6 +39,7 @@ class CaqCluEstimator {
     float q_l2sqr_ = 0;
     Lut lut_;
     const CAQClusterData *curr_cluster_;
+    FloatVec cent_ip_correction_; // 2 * ip_cent_oa * rescale, per vector (L2 only)
 
     QueryRuntimeMetrics runtime_statics_;
 
@@ -65,6 +66,10 @@ class CaqCluEstimator {
         } else {
             query_data_ = query;
         }
+        // Build LUT once from query (shared across all clusters for this query).
+        // For L2, the per-cluster centroid correction is applied separately in prepare().
+        // For IP, this is already the correct approach (no centroid subtraction needed).
+        lut_.prepare(query_data_);
     }
 
     ~CaqCluEstimator() = default;
@@ -83,6 +88,16 @@ class CaqCluEstimator {
 
     auto getRuntimeMetrics() const { return runtime_statics_; }
 
+    // Accessors for distances_batch_4 in saq_wrapper.h
+    const Lut& getLut() const { return lut_; }
+    float getSqDelta() const { return static_cast<float>(sq_delta_); }
+    float getQl2sqr() const { return q_l2sqr_; }
+    float getCentCorrection(size_t vec_idx) const {
+        // cent_ip_correction_ is only filled for L2; empty for IP or before prepare().
+        if (static_cast<size_t>(cent_ip_correction_.size()) <= vec_idx) return 0.0f;
+        return cent_ip_correction_[vec_idx];
+    }
+
     /**
      * @brief Prepare data before search
      *
@@ -92,16 +107,32 @@ class CaqCluEstimator {
      * @param cur_cluster Pointer to current cluster data
      */
     void prepare(const CAQClusterData *cur_cluster) {
-        // TODO: prepare only once instead of for each cluster, if factor_ip_cent_oa is set.
         curr_cluster_ = cur_cluster;
         const auto &centroid = cur_cluster->centroid();
         if (isIpDist()) {
+            // IP: LUT already built from query_data_ in constructor.
+            // Only need per-cluster <q, c> correction.
             ip_q_c_ = query_data_.dot(centroid);
-            lut_.prepare(query_data_);
             q_l2sqr_ = lut_.getQL2Sqr();
         } else {
-            lut_.prepare(query_data_ - centroid);
-            q_l2sqr_ = lut_.getQL2Sqr();
+            // L2: LUT already built from query_data_ (not q-c) in constructor.
+            // Compute ||q-c||² per cluster (cheap, O(dim)).
+            q_l2sqr_ = (query_data_ - centroid).squaredNorm();
+
+            // Precompute per-vector centroid correction: 2 * ip_cent_oa * rescale.
+            // <q-c, r> = <q, r> - <c, r>  ≈  ip_o_q - ip_cent_oa * rescale
+            // dist = ||r||² + ||q-c||² - 2*<q-c,r>
+            //      = ||r||² + ||q-c||² - 2*ip_o_q + cent_ip_correction[j]
+            const size_t n       = cur_cluster->num_vec_;
+            const size_t n_align = cur_cluster->num_vec_align_;
+            cent_ip_correction_.setZero(n_align);
+            for (size_t j = 0; j < n; ++j) {
+                const size_t blk  = j / KFastScanSize;
+                const size_t pos  = j % KFastScanSize;
+                float ip_oa    = cur_cluster->factor_ip_cent_oa(blk)[pos];
+                float rescale  = cur_cluster->long_factor(j).rescale;
+                cent_ip_correction_[j] = 2.0f * ip_oa * rescale;
+            }
         }
     }
 
@@ -164,13 +195,20 @@ class CaqCluEstimator {
             fst_distances[0] = _mm512_add_ps(_mm512_mul_ps(fst_distances[0], naghalf_c), simd_qc_ip);
             fst_distances[1] = _mm512_add_ps(_mm512_mul_ps(fst_distances[1], naghalf_c), simd_qc_ip);
         } else {
+            // fst_distances[i] currently holds 2*<q, r>_fast (LUT built from q, not q-c).
+            // Apply centroid correction: dist = ||r||² + ||q-c||² - 2*<q,r>_fast + cent_ip_correction
             __m512 simd_q2c_dist2 = _mm512_set1_ps(q_l2sqr_);
             __m512 simd_x0 = _mm512_loadu_ps(o_l2norm);
             __m512 simd_x1 = _mm512_loadu_ps(o_l2norm + 16);
-            fst_distances[0] = _mm512_add_ps(_mm512_mul_ps(simd_x0, simd_x0),
-                                             _mm512_sub_ps(simd_q2c_dist2, fst_distances[0]));
-            fst_distances[1] = _mm512_add_ps(_mm512_mul_ps(simd_x1, simd_x1),
-                                             _mm512_sub_ps(simd_q2c_dist2, fst_distances[1]));
+            const float *corr_ptr = cent_ip_correction_.data() + block_idx * KFastScanSize;
+            __m512 corr0 = _mm512_loadu_ps(corr_ptr);
+            __m512 corr1 = _mm512_loadu_ps(corr_ptr + 16);
+            fst_distances[0] = _mm512_add_ps(
+                _mm512_mul_ps(simd_x0, simd_x0),
+                _mm512_add_ps(_mm512_sub_ps(simd_q2c_dist2, fst_distances[0]), corr0));
+            fst_distances[1] = _mm512_add_ps(
+                _mm512_mul_ps(simd_x1, simd_x1),
+                _mm512_add_ps(_mm512_sub_ps(simd_q2c_dist2, fst_distances[1]), corr1));
             fst_distances[0] = _mm512_max_ps(_mm512_setzero_ps(), fst_distances[0]);
             fst_distances[1] = _mm512_max_ps(_mm512_setzero_ps(), fst_distances[1]);
         }
@@ -211,7 +249,10 @@ class CaqCluEstimator {
         if (cfg_.dist_type == DistType::IP) {
             return ip_o_q + ip_q_c_;
         } else {
-            float est_dist = o_l2sqr + q_l2sqr_ - 2 * ip_o_q;
+            // ip_o_q ≈ <q, r>; correct to <q-c, r> = <q, r> - ip_cent_oa * rescale
+            // dist = ||r||² + ||q-c||² - 2*<q-c,r>
+            //      = o_l2sqr + q_l2sqr_ - 2*ip_o_q + cent_ip_correction_[vec_idx]
+            float est_dist = o_l2sqr + q_l2sqr_ - 2 * ip_o_q + cent_ip_correction_[vec_idx];
             return est_dist;
         }
     }
