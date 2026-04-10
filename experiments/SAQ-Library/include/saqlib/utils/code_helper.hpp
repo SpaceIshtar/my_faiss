@@ -90,6 +90,42 @@ class CodeHelper {
         froce_decompact(y, rec.get(), D);
         return CodeHelper<8>::compute_ip(query, rec.get(), D);
     }
+
+    // 4-way batched IP: load query once, apply to 4 different codes.
+    // Specializations for bits=0,1,8 override this general fallback.
+    static void compute_ip_4(
+            const float *__restrict__ query,
+            const uint8_t *__restrict__ y0,
+            const uint8_t *__restrict__ y1,
+            const uint8_t *__restrict__ y2,
+            const uint8_t *__restrict__ y3,
+            size_t D,
+            float &r0, float &r1, float &r2, float &r3) {
+        if constexpr (kBits == 0) {
+            r0 = r1 = r2 = r3 = 0.0f;
+            return;
+        }
+        if constexpr (kBits > 8) {
+            float a0, a1, a2, a3, b0, b1, b2, b3;
+            CodeHelper<8>::compute_ip_4(query, y0, y1, y2, y3, D, a0, a1, a2, a3);
+            CodeHelper<kBits - 8>::compute_ip_4(
+                    query, y0 + D, y1 + D, y2 + D, y3 + D, D, b0, b1, b2, b3);
+            r0 = a0 + 256.0f * b0; r1 = a1 + 256.0f * b1;
+            r2 = a2 + 256.0f * b2; r3 = a3 + 256.0f * b3;
+            return;
+        }
+        // kBits in [1,8]: decompact each code to 8-bit, then batch IP.
+        auto rec0 = memory::make_unique_array<uint8_t>(D, 64);
+        auto rec1 = memory::make_unique_array<uint8_t>(D, 64);
+        auto rec2 = memory::make_unique_array<uint8_t>(D, 64);
+        auto rec3 = memory::make_unique_array<uint8_t>(D, 64);
+        froce_decompact(y0, rec0.get(), D);
+        froce_decompact(y1, rec1.get(), D);
+        froce_decompact(y2, rec2.get(), D);
+        froce_decompact(y3, rec3.get(), D);
+        CodeHelper<8>::compute_ip_4(
+                query, rec0.get(), rec1.get(), rec2.get(), rec3.get(), D, r0, r1, r2, r3);
+    }
 };
 
 template <>
@@ -133,6 +169,46 @@ inline float CodeHelper<1>::compute_ip(const float *__restrict__ query, const ui
         }
     }
     return ans;
+#endif
+}
+
+// 4-way specialization for bits=1: load query once, apply 4 bitmasks simultaneously.
+template <>
+inline void CodeHelper<1>::compute_ip_4(
+        const float *__restrict__ query,
+        const uint8_t *__restrict__ y0,
+        const uint8_t *__restrict__ y1,
+        const uint8_t *__restrict__ y2,
+        const uint8_t *__restrict__ y3,
+        size_t len,
+        float &r0, float &r1, float &r2, float &r3) {
+#if defined(__AVX512F__)
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    __m512 acc2 = _mm512_setzero_ps();
+    __m512 acc3 = _mm512_setzero_ps();
+    for (size_t i = 0; i < len; i += 16) {
+        __m512 q = _mm512_loadu_ps(query + i); // loaded once, shared by all 4
+        const uint8_t *m0 = y0 + (i / 8);
+        const uint8_t *m1 = y1 + (i / 8);
+        const uint8_t *m2 = y2 + (i / 8);
+        const uint8_t *m3 = y3 + (i / 8);
+        __mmask16 k0 = _cvtu32_mask16(m0[0] | ((uint32_t)m0[1] << 8));
+        __mmask16 k1 = _cvtu32_mask16(m1[0] | ((uint32_t)m1[1] << 8));
+        __mmask16 k2 = _cvtu32_mask16(m2[0] | ((uint32_t)m2[1] << 8));
+        __mmask16 k3 = _cvtu32_mask16(m3[0] | ((uint32_t)m3[1] << 8));
+        acc0 = _mm512_add_ps(acc0, _mm512_maskz_mov_ps(k0, q));
+        acc1 = _mm512_add_ps(acc1, _mm512_maskz_mov_ps(k1, q));
+        acc2 = _mm512_add_ps(acc2, _mm512_maskz_mov_ps(k2, q));
+        acc3 = _mm512_add_ps(acc3, _mm512_maskz_mov_ps(k3, q));
+    }
+    r0 = _mm512_reduce_add_ps(acc0);
+    r1 = _mm512_reduce_add_ps(acc1);
+    r2 = _mm512_reduce_add_ps(acc2);
+    r3 = _mm512_reduce_add_ps(acc3);
+#else
+    r0 = compute_ip(query, y0, len); r1 = compute_ip(query, y1, len);
+    r2 = compute_ip(query, y2, len); r3 = compute_ip(query, y3, len);
 #endif
 }
 
@@ -590,6 +666,46 @@ inline float CodeHelper<8>::compute_ip(const float *__restrict__ x, const uint8_
     return result;
 }
 
+// 4-way specialization for bits=8: load query once, fmadd against 4 uint8 code arrays.
+template <>
+inline void CodeHelper<8>::compute_ip_4(
+        const float *__restrict__ query,
+        const uint8_t *__restrict__ y0,
+        const uint8_t *__restrict__ y1,
+        const uint8_t *__restrict__ y2,
+        const uint8_t *__restrict__ y3,
+        size_t D,
+        float &r0, float &r1, float &r2, float &r3) {
+#if defined(__AVX512F__)
+    __m512 sum0 = _mm512_setzero_ps();
+    __m512 sum1 = _mm512_setzero_ps();
+    __m512 sum2 = _mm512_setzero_ps();
+    __m512 sum3 = _mm512_setzero_ps();
+    for (size_t i = 0; i < D; i += 16) {
+        __m512 xx = _mm512_load_ps(&query[i]); // loaded once, shared by all 4
+        sum0 = _mm512_fmadd_ps(
+                xx, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                    _mm_loadu_si128((const __m128i *)&y0[i]))), sum0);
+        sum1 = _mm512_fmadd_ps(
+                xx, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                    _mm_loadu_si128((const __m128i *)&y1[i]))), sum1);
+        sum2 = _mm512_fmadd_ps(
+                xx, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                    _mm_loadu_si128((const __m128i *)&y2[i]))), sum2);
+        sum3 = _mm512_fmadd_ps(
+                xx, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                    _mm_loadu_si128((const __m128i *)&y3[i]))), sum3);
+    }
+    r0 = _mm512_reduce_add_ps(sum0);
+    r1 = _mm512_reduce_add_ps(sum1);
+    r2 = _mm512_reduce_add_ps(sum2);
+    r3 = _mm512_reduce_add_ps(sum3);
+#else
+    r0 = compute_ip(query, y0, D); r1 = compute_ip(query, y1, D);
+    r2 = compute_ip(query, y2, D); r3 = compute_ip(query, y3, D);
+#endif
+}
+
 // template <size_t bits>
 // inline void CodeHelper<bits>::compacted_code16(uint8_t *o_compact, const uint16_t *o_raw16, size_t num_dim)
 
@@ -634,6 +750,48 @@ inline auto get_IP_FUNC(int bits) -> float (*)(const float *__restrict__, const 
         return CodeHelper<16>::compute_ip;
     default:
         std::cerr << "Error: Unsupported bits: " << bits << std::endl;
+        assert(false);
+    }
+    return nullptr;
+}
+
+// 4-way IP function pointer type and factory
+using IP_FUNC_4_t = void (*)(
+        const float *__restrict__,
+        const uint8_t *__restrict__, const uint8_t *__restrict__,
+        const uint8_t *__restrict__, const uint8_t *__restrict__,
+        size_t, float &, float &, float &, float &);
+
+template <size_t kBits>
+inline void ip_func_4_dispatch(
+        const float *__restrict__ query,
+        const uint8_t *__restrict__ y0, const uint8_t *__restrict__ y1,
+        const uint8_t *__restrict__ y2, const uint8_t *__restrict__ y3,
+        size_t D, float &r0, float &r1, float &r2, float &r3) {
+    CodeHelper<kBits>::compute_ip_4(query, y0, y1, y2, y3, D, r0, r1, r2, r3);
+}
+
+inline IP_FUNC_4_t get_IP_FUNC_4(int bits) {
+    switch (bits) {
+    case 0:  return ip_func_4_dispatch<0>;
+    case 1:  return ip_func_4_dispatch<1>;
+    case 2:  return ip_func_4_dispatch<2>;
+    case 3:  return ip_func_4_dispatch<3>;
+    case 4:  return ip_func_4_dispatch<4>;
+    case 5:  return ip_func_4_dispatch<5>;
+    case 6:  return ip_func_4_dispatch<6>;
+    case 7:  return ip_func_4_dispatch<7>;
+    case 8:  return ip_func_4_dispatch<8>;
+    case 9:  return ip_func_4_dispatch<9>;
+    case 10: return ip_func_4_dispatch<10>;
+    case 11: return ip_func_4_dispatch<11>;
+    case 12: return ip_func_4_dispatch<12>;
+    case 13: return ip_func_4_dispatch<13>;
+    case 14: return ip_func_4_dispatch<14>;
+    case 15: return ip_func_4_dispatch<15>;
+    case 16: return ip_func_4_dispatch<16>;
+    default:
+        std::cerr << "Error: Unsupported bits for IP_FUNC_4: " << bits << std::endl;
         assert(false);
     }
     return nullptr;

@@ -29,6 +29,7 @@ class Lut
     const float one_over_sqrtD_;
     float (*const IP_FUNC)(const float *__restrict__, const uint8_t *__restrict__, size_t) = nullptr; // Function to get ip between query and long code
     // TODO: WARNING!!! the return type of IP_FUNC is float, but the return value should be double when B>13
+    const utils::IP_FUNC_4_t IP_FUNC_4_ = nullptr; // 4-way batch IP function
 
     FloatVec query_;
     RowVector<uint8_t> lut_;
@@ -45,16 +46,26 @@ class Lut
     explicit Lut(size_t num_dim_padded, size_t ex_bits)
         : num_dim_padded_(num_dim_padded), table_length_(num_dim_padded / 8 * KFastScanSize),
           one_over_sqrtD_(1.0 / std::sqrt((float)num_dim_padded_)),
-          IP_FUNC(utils::get_IP_FUNC(ex_bits))
+          IP_FUNC(utils::get_IP_FUNC(ex_bits)),
+          IP_FUNC_4_(utils::get_IP_FUNC_4(ex_bits))
     {
         lut_ = RowVector<uint8_t>::Zero(table_length_ * (use_highacc_ ? 2 : 1));
     }
 
     ~Lut() = default;
 
-    float getQL2Sqr() const
-    {
-        return q_l2sqr_;
+    float getQL2Sqr() const { return q_l2sqr_; }
+    float getSumQ() const { return sum_q_; }
+    // Get precomputed LUT-based estimate for position j in current block (set by compFastIP).
+    float getIPXBQPrime(size_t j) const { return ip_xb_qprime_[j]; }
+
+    // Batch raw IP: load query once, compute against 4 different codes.
+    // Does NOT use ip_xb_qprime_ — call getIPXBQPrime separately.
+    void computeRawIPs_4(
+            const uint8_t *c0, const uint8_t *c1,
+            const uint8_t *c2, const uint8_t *c3,
+            float &r0, float &r1, float &r2, float &r3) const {
+        IP_FUNC_4_(query_.data(), c0, c1, c2, c3, num_dim_padded_, r0, r1, r2, r3);
     }
 
     void prepare(FloatVec query)
