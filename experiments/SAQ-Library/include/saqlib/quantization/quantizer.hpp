@@ -57,11 +57,17 @@ class QuantizerCluster {
         CAQEncoder encoder(num_dim_pad_, num_bits_, data_->cfg);
         ClusterPacker packer(num_dim_pad_, num_bits_, clus, data_->cfg.use_fastscan);
 
+        // Feed the encoder the ROTATED centroid. curr_vec (o_vecs.row(i)) is
+        // the residual in the rotated space, so ip_cent_oa must be computed
+        // with the centroid in that same space. Previously this passed the
+        // un-rotated `centroid`, which silently corrupted the L2 centroid
+        // correction whenever data_->rotator was non-null (the default).
+        const FloatVec rotated_cent = clus.centroid();
         QuantBaseCode base_code;
         for (size_t i = 0; i < num_points; ++i) {
             const auto &curr_vec = o_vecs.row(i);
 
-            encoder.encode_and_fac(curr_vec, base_code, &centroid);
+            encoder.encode_and_fac(curr_vec, base_code, &rotated_cent);
             packer.store_and_pack(i, base_code);
 
             // Update metrics

@@ -44,88 +44,9 @@ namespace hnsw_bench {
 
 class SAQWrapper;
 
-struct SAQProfileStats {
-    std::atomic<uint64_t> set_query_calls{0};
-    std::atomic<uint64_t> set_query_ns{0};
-    std::atomic<uint64_t> prototype_build_calls{0};
-    std::atomic<uint64_t> prototype_build_ns{0};
-    std::atomic<uint64_t> cluster_prepare_calls{0};
-    std::atomic<uint64_t> cluster_prepare_ns{0};
-    std::atomic<uint64_t> fast_block_calls{0};
-    std::atomic<uint64_t> fast_block_ns{0};
-    std::atomic<uint64_t> accurate_calls{0};
-    std::atomic<uint64_t> accurate_ns{0};
-
-    static bool enabled() {
-        static const bool kEnabled = []() {
-            const char* env = std::getenv("HNSW_SAQ_PROFILE");
-            return env && env[0] != '\0' && std::strcmp(env, "0") != 0;
-        }();
-        return kEnabled;
-    }
-
-    void report() const {
-        const auto sq_calls = set_query_calls.load(std::memory_order_relaxed);
-        if (!enabled() || sq_calls == 0) {
-            return;
-        }
-
-        const auto proto_calls = prototype_build_calls.load(std::memory_order_relaxed);
-        const auto prep_calls = cluster_prepare_calls.load(std::memory_order_relaxed);
-        const auto fast_calls = fast_block_calls.load(std::memory_order_relaxed);
-        const auto acc_calls = accurate_calls.load(std::memory_order_relaxed);
-
-        auto to_ms = [](uint64_t ns) { return static_cast<double>(ns) / 1e6; };
-        auto avg_us = [](uint64_t ns, uint64_t calls) {
-            return calls ? static_cast<double>(ns) / calls / 1e3 : 0.0;
-        };
-
-        std::cerr << "\n[SAQ HNSW Profile]\n"
-                  << "  set_query:        calls=" << sq_calls
-                  << " total_ms=" << to_ms(set_query_ns.load(std::memory_order_relaxed))
-                  << " avg_us=" << avg_us(set_query_ns.load(std::memory_order_relaxed), sq_calls) << "\n"
-                  << "  prototype_build:  calls=" << proto_calls
-                  << " total_ms=" << to_ms(prototype_build_ns.load(std::memory_order_relaxed))
-                  << " avg_us=" << avg_us(prototype_build_ns.load(std::memory_order_relaxed), proto_calls) << "\n"
-                  << "  cluster_prepare:  calls=" << prep_calls
-                  << " total_ms=" << to_ms(cluster_prepare_ns.load(std::memory_order_relaxed))
-                  << " avg_us=" << avg_us(cluster_prepare_ns.load(std::memory_order_relaxed), prep_calls)
-                  << " avg_per_query=" << (sq_calls ? static_cast<double>(prep_calls) / sq_calls : 0.0) << "\n"
-                  << "  fast_block:       calls=" << fast_calls
-                  << " total_ms=" << to_ms(fast_block_ns.load(std::memory_order_relaxed))
-                  << " avg_us=" << avg_us(fast_block_ns.load(std::memory_order_relaxed), fast_calls)
-                  << " avg_per_query=" << (sq_calls ? static_cast<double>(fast_calls) / sq_calls : 0.0) << "\n"
-                  << "  accurate:         calls=" << acc_calls
-                  << " total_ms=" << to_ms(accurate_ns.load(std::memory_order_relaxed))
-                  << " avg_us=" << avg_us(accurate_ns.load(std::memory_order_relaxed), acc_calls)
-                  << " avg_per_query=" << (sq_calls ? static_cast<double>(acc_calls) / sq_calls : 0.0) << "\n";
-    }
-
-    ~SAQProfileStats() {
-        report();
-    }
-};
-
-inline SAQProfileStats& saq_profile_stats() {
-    static SAQProfileStats stats;
-    return stats;
-}
-
-template <typename F>
-inline auto saq_profile_scope(std::atomic<uint64_t>& total_ns, F&& fn) {
-    const auto t0 = std::chrono::steady_clock::now();
-    auto result = fn();
-    const auto t1 = std::chrono::steady_clock::now();
-    total_ns.fetch_add(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count(),
-            std::memory_order_relaxed);
-    return result;
-}
-
 class SAQDistanceComputer : public faiss::DistanceComputer {
    public:
     using FastEstimator = saqlib::SaqCluEstimator<saqlib::DistType::L2Sqr>;
-    using SingleEstimator = saqlib::SaqCluEstimatorSingle<saqlib::DistType::L2Sqr>;
 
     explicit SAQDistanceComputer(const SAQWrapper* parent)
             : parent_(parent) {
@@ -152,24 +73,12 @@ class SAQDistanceComputer : public faiss::DistanceComputer {
     }
 
    private:
-    struct PreparedClusterState {
-        std::unique_ptr<FastEstimator> fast_estimator;
-        std::unique_ptr<SingleEstimator> single_estimator;
-        uint32_t generation = 0;
-        uint32_t prepared_block = std::numeric_limits<uint32_t>::max();
-    };
-
     const SAQWrapper* parent_;
     saqlib::SearcherConfig searcher_cfg_;
     saqlib::FloatVec query_;
-    bool use_cluster_cache_ = false;
-    bool use_fastscan_path_ = true;
     std::unique_ptr<FastEstimator> fast_estimator_;
-    std::unique_ptr<SingleEstimator> single_estimator_;
     uint32_t prepared_cluster_ = std::numeric_limits<uint32_t>::max();
     uint32_t prepared_block_ = std::numeric_limits<uint32_t>::max();
-    std::vector<PreparedClusterState> cluster_cache_;
-    uint32_t query_generation_ = 0;
 };
 
 class SAQWrapper : public QuantWrapper {
@@ -182,8 +91,6 @@ class SAQWrapper : public QuantWrapper {
             int seg_eqseg = 0,
             bool use_compact_layout = false,
             bool random_rotation = true,
-            bool use_fastscan = false,
-            bool cluster_cache_enabled = true,
             faiss::MetricType metric = faiss::METRIC_L2)
             : d_(d),
               avg_bits_(avg_bits),
@@ -192,8 +99,6 @@ class SAQWrapper : public QuantWrapper {
               seg_eqseg_(seg_eqseg),
               use_compact_layout_(use_compact_layout),
               random_rotation_(random_rotation),
-              use_fastscan_(use_fastscan),
-              cluster_cache_enabled_(cluster_cache_enabled),
               metric_(metric) {
         if (d_ == 0) {
             throw std::runtime_error("SAQWrapper: dimension must be > 0");
@@ -242,7 +147,7 @@ class SAQWrapper : public QuantWrapper {
         cfg.seg_eqseg = seg_eqseg_;
         cfg.use_compact_layout = use_compact_layout_;
         cfg.single.random_rotation = random_rotation_;
-        cfg.single.use_fastscan = use_fastscan_;
+        cfg.single.use_fastscan = true;
 
         saqlib::SaqDataMaker data_maker(cfg, d_);
         saqlib::FloatRowMat padded_data(n, data_maker.getPaddedDim());
@@ -252,10 +157,6 @@ class SAQWrapper : public QuantWrapper {
         saq_data_ = data_maker.return_data();
 
         // 4) Reset encoded data. add() will populate searchable clusters.
-        const bool use_fastscan =
-                saq_data_ && !saq_data_->base_datas.empty()
-                ? saq_data_->base_datas.front().cfg.use_fastscan
-                : true;
         clusters_.clear();
         clusters_.resize(num_clusters_);
         for (size_t c = 0; c < num_clusters_; ++c) {
@@ -263,7 +164,7 @@ class SAQWrapper : public QuantWrapper {
                     0,
                     saq_data_->quant_plan,
                     use_compact_layout_,
-                    use_fastscan);
+                    /*use_fastscan=*/true);
         }
         vector_cluster_ids_.clear();
         vector_offsets_.clear();
@@ -303,10 +204,6 @@ class SAQWrapper : public QuantWrapper {
             local_id_lists[cid].push_back(static_cast<saqlib::PID>(i));
         }
 
-        const bool use_fastscan =
-                saq_data_ && !saq_data_->base_datas.empty()
-                ? saq_data_->base_datas.front().cfg.use_fastscan
-                : true;
         std::vector<uint32_t> base_offsets(num_clusters_, 0);
         for (size_t c = 0; c < num_clusters_; ++c) {
             if (clusters_[c]) {
@@ -330,7 +227,7 @@ class SAQWrapper : public QuantWrapper {
                         ids_in_cluster.size(),
                         saq_data_->quant_plan,
                         use_compact_layout_,
-                        use_fastscan);
+                        /*use_fastscan=*/true);
                 std::memcpy(
                         centroid.data(),
                         centroids_.data() + static_cast<size_t>(c) * d_,
@@ -380,9 +277,6 @@ class SAQWrapper : public QuantWrapper {
         }
         if (!random_rotation_) {
             oss << "_norot";
-        }
-        if (!use_fastscan_) {
-            oss << "_nofast";
         }
         return oss.str();
     }
@@ -516,19 +410,15 @@ class SAQWrapper : public QuantWrapper {
 
         saq_data_ = std::make_unique<saqlib::SaqData>();
         saq_data_->load(ifs);
-        const bool loaded_use_fastscan =
-                !saq_data_->base_datas.empty()
-                ? saq_data_->base_datas.front().cfg.use_fastscan
-                : true;
-        if (loaded_use_fastscan != use_fastscan_) {
+        // Only fastscan-trained files are supported now — reject anything
+        // persisted with use_fastscan=false so we fail fast instead of
+        // silently mis-decoding.
+        if (!saq_data_->base_datas.empty() &&
+            !saq_data_->base_datas.front().cfg.use_fastscan) {
             return false;
         }
 
         const uint64_t num_clusters_stored = read_u64();
-        const bool use_fastscan =
-                !saq_data_->base_datas.empty()
-                ? saq_data_->base_datas.front().cfg.use_fastscan
-                : true;
         clusters_.clear();
         clusters_.resize(num_clusters_stored);
         for (size_t c = 0; c < num_clusters_stored; ++c) {
@@ -537,7 +427,7 @@ class SAQWrapper : public QuantWrapper {
                         num_vec,
                         saq_data_->quant_plan,
                         use_compact_layout_,
-                        use_fastscan);
+                        /*use_fastscan=*/true);
             clusters_[c]->load(ifs);
         }
 
@@ -571,8 +461,6 @@ class SAQWrapper : public QuantWrapper {
     int seg_eqseg_;
     bool use_compact_layout_;
     bool random_rotation_;
-    bool use_fastscan_;
-    bool cluster_cache_enabled_;
     faiss::MetricType metric_;
 
     size_t ntotal_ = 0;
@@ -588,117 +476,12 @@ class SAQWrapper : public QuantWrapper {
 };
 
 inline void SAQDistanceComputer::set_query(const float* x) {
-    const bool profile_enabled = SAQProfileStats::enabled();
-    const auto set_query_begin =
-            profile_enabled ? std::chrono::steady_clock::now()
-                            : std::chrono::steady_clock::time_point{};
     query_.resize(parent_->d_);
     std::memcpy(query_.data(), x, sizeof(float) * parent_->d_);
-    use_cluster_cache_ = parent_->cluster_cache_enabled_;
-    use_fastscan_path_ = parent_->use_fastscan_;
-    if (use_cluster_cache_) {
-        if (cluster_cache_.size() != parent_->clusters_.size()) {
-            cluster_cache_.clear();
-            cluster_cache_.resize(parent_->clusters_.size());
-            query_generation_ = 0;
-        }
-        query_generation_++;
-        if (query_generation_ == 0) {
-            query_generation_ = 1;
-            for (auto& state : cluster_cache_) {
-                state.generation = 0;
-            }
-        }
-        if (profile_enabled) {
-            saq_profile_stats().prototype_build_calls.fetch_add(1, std::memory_order_relaxed);
-            if (use_fastscan_path_) {
-                fast_estimator_ = saq_profile_scope(
-                        saq_profile_stats().prototype_build_ns,
-                        [&]() {
-                            return std::make_unique<FastEstimator>(
-                                    *parent_->saq_data_,
-                                    searcher_cfg_,
-                                    query_);
-                        });
-                single_estimator_.reset();
-            } else {
-                single_estimator_ = saq_profile_scope(
-                        saq_profile_stats().prototype_build_ns,
-                        [&]() {
-                            return std::make_unique<SingleEstimator>(
-                                    *parent_->saq_data_,
-                                    searcher_cfg_,
-                                    query_);
-                        });
-                fast_estimator_.reset();
-            }
-        } else {
-            if (use_fastscan_path_) {
-                fast_estimator_ = std::make_unique<FastEstimator>(
-                        *parent_->saq_data_,
-                        searcher_cfg_,
-                        query_);
-                single_estimator_.reset();
-            } else {
-                single_estimator_ = std::make_unique<SingleEstimator>(
-                        *parent_->saq_data_,
-                        searcher_cfg_,
-                        query_);
-                fast_estimator_.reset();
-            }
-        }
-    } else {
-        cluster_cache_.clear();
-        if (profile_enabled) {
-            saq_profile_stats().prototype_build_calls.fetch_add(1, std::memory_order_relaxed);
-            if (use_fastscan_path_) {
-                fast_estimator_ = saq_profile_scope(
-                        saq_profile_stats().prototype_build_ns,
-                        [&]() {
-                            return std::make_unique<FastEstimator>(
-                                    *parent_->saq_data_,
-                                    searcher_cfg_,
-                                    query_);
-                        });
-                single_estimator_.reset();
-            } else {
-                single_estimator_ = saq_profile_scope(
-                        saq_profile_stats().prototype_build_ns,
-                        [&]() {
-                            return std::make_unique<SingleEstimator>(
-                                    *parent_->saq_data_,
-                                    searcher_cfg_,
-                                    query_);
-                        });
-                fast_estimator_.reset();
-            }
-        } else {
-            if (use_fastscan_path_) {
-                fast_estimator_ = std::make_unique<FastEstimator>(
-                        *parent_->saq_data_,
-                        searcher_cfg_,
-                        query_);
-                single_estimator_.reset();
-            } else {
-                single_estimator_ = std::make_unique<SingleEstimator>(
-                        *parent_->saq_data_,
-                        searcher_cfg_,
-                        query_);
-                fast_estimator_.reset();
-            }
-        }
-        prepared_cluster_ = std::numeric_limits<uint32_t>::max();
-        prepared_block_ = std::numeric_limits<uint32_t>::max();
-    }
-    if (profile_enabled) {
-        saq_profile_stats().set_query_calls.fetch_add(1, std::memory_order_relaxed);
-        const auto set_query_end = std::chrono::steady_clock::now();
-        saq_profile_stats().set_query_ns.fetch_add(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        set_query_end - set_query_begin)
-                        .count(),
-                std::memory_order_relaxed);
-    }
+    fast_estimator_ = std::make_unique<FastEstimator>(
+            *parent_->saq_data_, searcher_cfg_, query_);
+    prepared_cluster_ = std::numeric_limits<uint32_t>::max();
+    prepared_block_   = std::numeric_limits<uint32_t>::max();
 }
 
 inline float SAQDistanceComputer::operator()(faiss::idx_t i) {
@@ -708,131 +491,22 @@ inline float SAQDistanceComputer::operator()(faiss::idx_t i) {
 
     const uint32_t cid = parent_->vector_cluster_ids_[i];
     const uint32_t off = parent_->vector_offsets_[i];
-    if (cid >= parent_->clusters_.size()) {
-        return std::numeric_limits<float>::infinity();
-    }
-    if (off >= parent_->clusters_[cid]->num_vec_) {
+    if (cid >= parent_->clusters_.size() ||
+        off >= parent_->clusters_[cid]->num_vec_) {
         return std::numeric_limits<float>::infinity();
     }
 
-    float dist = std::numeric_limits<float>::infinity();
     const uint32_t block = off / saqlib::KFastScanSize;
-    const bool profile_enabled = SAQProfileStats::enabled();
-    if (use_cluster_cache_) {
-        auto& state = cluster_cache_[cid];
-        if (state.generation != query_generation_) {
-            if (use_fastscan_path_) {
-                state.fast_estimator = std::make_unique<FastEstimator>(*fast_estimator_);
-                state.single_estimator.reset();
-            } else {
-                state.single_estimator = std::make_unique<SingleEstimator>(*single_estimator_);
-                state.fast_estimator.reset();
-            }
-            if (profile_enabled) {
-                saq_profile_stats().cluster_prepare_calls.fetch_add(1, std::memory_order_relaxed);
-                saq_profile_scope(
-                        saq_profile_stats().cluster_prepare_ns,
-                        [&]() {
-                            if (use_fastscan_path_) {
-                                state.fast_estimator->prepare(parent_->clusters_[cid].get());
-                            } else {
-                                state.single_estimator->prepare(parent_->clusters_[cid].get());
-                            }
-                            return 0;
-                        });
-            } else {
-                if (use_fastscan_path_) {
-                    state.fast_estimator->prepare(parent_->clusters_[cid].get());
-                } else {
-                    state.single_estimator->prepare(parent_->clusters_[cid].get());
-                }
-            }
-            state.generation = query_generation_;
-            state.prepared_block = std::numeric_limits<uint32_t>::max();
-        }
-
-        if (use_fastscan_path_ && block != state.prepared_block) {
-            if (profile_enabled) {
-                saq_profile_stats().fast_block_calls.fetch_add(1, std::memory_order_relaxed);
-                saq_profile_scope(
-                        saq_profile_stats().fast_block_ns,
-                        [&]() {
-                            state.fast_estimator->compFastDist(block, nullptr);
-                            return 0;
-                        });
-            } else {
-                state.fast_estimator->compFastDist(block, nullptr);
-            }
-            state.prepared_block = block;
-        }
-        if (profile_enabled) {
-            saq_profile_stats().accurate_calls.fetch_add(1, std::memory_order_relaxed);
-            dist = saq_profile_scope(
-                    saq_profile_stats().accurate_ns,
-                    [&]() {
-                        return use_fastscan_path_
-                                ? state.fast_estimator->compAccurateDist(off)
-                                : state.single_estimator->compAccurateDist(off);
-                    });
-        } else {
-            dist = use_fastscan_path_
-                    ? state.fast_estimator->compAccurateDist(off)
-                    : state.single_estimator->compAccurateDist(off);
-        }
-    } else {
-        if (cid != prepared_cluster_) {
-            if (profile_enabled) {
-                saq_profile_stats().cluster_prepare_calls.fetch_add(1, std::memory_order_relaxed);
-                saq_profile_scope(
-                        saq_profile_stats().cluster_prepare_ns,
-                        [&]() {
-                            if (use_fastscan_path_) {
-                                fast_estimator_->prepare(parent_->clusters_[cid].get());
-                            } else {
-                                single_estimator_->prepare(parent_->clusters_[cid].get());
-                            }
-                            return 0;
-                        });
-            } else {
-                if (use_fastscan_path_) {
-                    fast_estimator_->prepare(parent_->clusters_[cid].get());
-                } else {
-                    single_estimator_->prepare(parent_->clusters_[cid].get());
-                }
-            }
-            prepared_cluster_ = cid;
-            prepared_block_ = std::numeric_limits<uint32_t>::max();
-        }
-
-        if (use_fastscan_path_ && block != prepared_block_) {
-            if (profile_enabled) {
-                saq_profile_stats().fast_block_calls.fetch_add(1, std::memory_order_relaxed);
-                saq_profile_scope(
-                        saq_profile_stats().fast_block_ns,
-                        [&]() {
-                            fast_estimator_->compFastDist(block, nullptr);
-                            return 0;
-                        });
-            } else {
-                fast_estimator_->compFastDist(block, nullptr);
-            }
-            prepared_block_ = block;
-        }
-        if (profile_enabled) {
-            saq_profile_stats().accurate_calls.fetch_add(1, std::memory_order_relaxed);
-            dist = saq_profile_scope(
-                    saq_profile_stats().accurate_ns,
-                    [&]() {
-                        return use_fastscan_path_
-                                ? fast_estimator_->compAccurateDist(off)
-                                : single_estimator_->compAccurateDist(off);
-                    });
-        } else {
-            dist = use_fastscan_path_
-                    ? fast_estimator_->compAccurateDist(off)
-                    : single_estimator_->compAccurateDist(off);
-        }
+    if (cid != prepared_cluster_) {
+        fast_estimator_->prepare(parent_->clusters_[cid].get());
+        prepared_cluster_ = cid;
+        prepared_block_   = std::numeric_limits<uint32_t>::max();
     }
+    if (block != prepared_block_) {
+        fast_estimator_->compFastDist(block, nullptr);
+        prepared_block_ = block;
+    }
+    const float dist = fast_estimator_->compAccurateDist(off);
     if (!std::isfinite(dist)) {
         return std::numeric_limits<float>::infinity();
     }
@@ -848,13 +522,6 @@ inline void SAQDistanceComputer::distances_batch_4(
         float& dis1,
         float& dis2,
         float& dis3) {
-    // Fall back to sequential if not using fastscan path
-    if (!use_fastscan_path_) {
-        dis0 = (*this)(idx0); dis1 = (*this)(idx1);
-        dis2 = (*this)(idx2); dis3 = (*this)(idx3);
-        return;
-    }
-
     constexpr int N = 4;
     const faiss::idx_t idxs[N] = {idx0, idx1, idx2, idx3};
 
@@ -881,63 +548,40 @@ inline void SAQDistanceComputer::distances_batch_4(
     }
 
     // Phase 1: Prepare each cluster+block sequentially, save per-segment data.
-    // Key insight: after our LUT optimization, the Lut (IP_FUNC + query_) is shared
-    // across all clusters. We only need to save the cluster-specific values before
-    // switching to the next cluster.
+    // The Lut is shared across clusters (built once from q in the constructor),
+    // so we only need to save the cluster-specific values before switching to
+    // the next cluster.
     float saved_ip_xbq[N][kMaxSegs] = {};
     float saved_q_l2sqr[N][kMaxSegs] = {};
     float saved_cent_corr[N][kMaxSegs] = {};
 
-    if (use_cluster_cache_) {
-        for (int i = 0; i < N; i++) {
-            auto& state = cluster_cache_[cids[i]];
-            if (state.generation != query_generation_) {
-                state.fast_estimator =
-                        std::make_unique<FastEstimator>(*fast_estimator_);
-                state.fast_estimator->prepare(parent_->clusters_[cids[i]].get());
-                state.generation = query_generation_;
-                state.prepared_block = std::numeric_limits<uint32_t>::max();
-            }
-            if (blks[i] != state.prepared_block) {
-                state.fast_estimator->compFastDist(blks[i], nullptr);
-                state.prepared_block = blks[i];
-            }
-            for (size_t s = 0; s < n_segs; s++) {
-                auto& est = state.fast_estimator->getEstimators()[s];
-                saved_ip_xbq[i][s] =
-                        est.getLut().getIPXBQPrime(offs[i] % saqlib::KFastScanSize);
-                saved_q_l2sqr[i][s] = est.getQl2sqr();
-                saved_cent_corr[i][s] = est.getCentCorrection(offs[i]);
-            }
+    for (int i = 0; i < N; i++) {
+        if (cids[i] != prepared_cluster_) {
+            fast_estimator_->prepare(parent_->clusters_[cids[i]].get());
+            prepared_cluster_ = cids[i];
+            prepared_block_ = std::numeric_limits<uint32_t>::max();
         }
-    } else {
-        for (int i = 0; i < N; i++) {
-            if (cids[i] != prepared_cluster_) {
-                fast_estimator_->prepare(parent_->clusters_[cids[i]].get());
-                prepared_cluster_ = cids[i];
-                prepared_block_ = std::numeric_limits<uint32_t>::max();
-            }
-            if (blks[i] != prepared_block_) {
-                fast_estimator_->compFastDist(blks[i], nullptr);
-                prepared_block_ = blks[i];
-            }
-            // Save before this cluster's state is overwritten by next iteration
-            for (size_t s = 0; s < n_segs; s++) {
-                auto& est = fast_estimator_->getEstimators()[s];
-                saved_ip_xbq[i][s] =
-                        est.getLut().getIPXBQPrime(offs[i] % saqlib::KFastScanSize);
-                saved_q_l2sqr[i][s] = est.getQl2sqr();
-                saved_cent_corr[i][s] = est.getCentCorrection(offs[i]);
-            }
+        if (blks[i] != prepared_block_) {
+            fast_estimator_->compFastDist(blks[i], nullptr);
+            prepared_block_ = blks[i];
+        }
+        // Save before this cluster's state is overwritten by next iteration
+        for (size_t s = 0; s < n_segs; s++) {
+            auto& est = fast_estimator_->getEstimators()[s];
+            saved_ip_xbq[i][s] =
+                    est.getLut().getIPXBQPrime(offs[i] % saqlib::KFastScanSize);
+            saved_q_l2sqr[i][s] = est.getQl2sqr();
+            saved_cent_corr[i][s] = est.getCentCorrection(offs[i]);
         }
     }
 
-    // Phase 2: Per-segment batch IP + combine.
-    // fast_estimator_->getEstimators()[s].getLut() has the correct IP_FUNC_4 and
-    // query_ for segment s (these are query-derived, not cluster-specific).
+    // Phase 2: Per-segment batch IP + combine. The Lut is shared across all
+    // clusters (built once from q in the constructor), so computeRawIPs_4
+    // can pass in long_codes from four different clusters. The per-cluster
+    // terms are saved_q_l2sqr (= ||q - c_i||²) and saved_cent_corr (=
+    // 2 * rescale * <c_i, nominal_r>).
     float dis[N] = {};
     for (size_t s = 0; s < n_segs; s++) {
-        // Gather per-vector cluster data for segment s
         const uint8_t* long_codes[N];
         float rescales[N], o_l2norms[N];
         for (int i = 0; i < N; i++) {
@@ -947,7 +591,6 @@ inline void SAQDistanceComputer::distances_batch_4(
             o_l2norms[i] = seg.factor_o_l2norm(blks[i])[offs[i] % saqlib::KFastScanSize];
         }
 
-        // 4-way raw IP: query loaded once, applied to 4 different long codes
         float raw[N];
         fast_estimator_->getEstimators()[s].getLut().computeRawIPs_4(
                 long_codes[0], long_codes[1], long_codes[2], long_codes[3],
@@ -958,7 +601,7 @@ inline void SAQDistanceComputer::distances_batch_4(
                 fast_estimator_->getEstimators()[s].getLut().getSumQ();
 
         for (int i = 0; i < N; i++) {
-            // Reconstruct ext_ip from saved ip_xb_qprime and new raw IP
+            // ext_ip ≈ <q, nominal_r_i> (LUT built from q, sum_q = sum(q)).
             float ext_ip =
                     saved_ip_xbq[i][s] + raw[i] * sq_delta +
                     (-1.0f + sq_delta * 0.5f) * sum_q;
@@ -994,8 +637,6 @@ inline std::unique_ptr<QuantWrapper> create_saq_wrapper(
     int seg_eqseg = 0;
     bool use_compact_layout = false;
     bool random_rotation = true;
-    bool use_fastscan = false;
-    bool cluster_cache_enabled = true;
 
     if (auto it = params.find("avg_bits"); it != params.end()) {
         avg_bits = std::stof(it->second);
@@ -1021,12 +662,6 @@ inline std::unique_ptr<QuantWrapper> create_saq_wrapper(
     if (auto it = params.find("rand_rotate"); it != params.end()) {
         random_rotation = parse_saq_bool(it->second);
     }
-    if (auto it = params.find("use_fastscan"); it != params.end()) {
-        use_fastscan = parse_saq_bool(it->second);
-    }
-    if (auto it = params.find("cluster_cache"); it != params.end()) {
-        cluster_cache_enabled = parse_saq_bool(it->second);
-    }
 
     return std::make_unique<SAQWrapper>(
             d,
@@ -1036,8 +671,6 @@ inline std::unique_ptr<QuantWrapper> create_saq_wrapper(
             seg_eqseg,
             use_compact_layout,
             random_rotation,
-            use_fastscan,
-            cluster_cache_enabled,
             metric);
 }
 
