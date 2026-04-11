@@ -236,10 +236,44 @@ class CAQEncoder {
         base_code.o_l2norm = caq.o_l2norm;
         base_code.fac_rescale = caq.fac_rescale;
         base_code.fac_error = caq.fac_error;
+
+        // Per-vector centroid factor consumed by CaqCluEstimator::prepare
+        // when the LUT is built once from the query (not q-c).
+        //
+        // We need <c, nominal_r> where nominal_r is the vector that
+        // Lut::getExtIP reconstructs at query time:
+        //     getExtIP = <q, sign_mask> + <q, long_code> * caq_delta
+        //              + (-1 + caq_delta/2) * sum(q)
+        //              = <q, nominal_r>
+        //     nominal_r[i] = code[i] * caq_delta + (-1 + caq_delta/2)
+        //     caq_delta   = 2 / 2^num_bits   (fixed grid, per-estimator)
+        //
+        // Therefore <c, nominal_r> = caq_delta * <c, code> + v_nom * sum(c),
+        // where both c and code live in the SAME (rotated) space — the
+        // caller must pass the rotated centroid.
+        //
+        // The previous code stored centroid->dot(caq.get_oa()), which had
+        // two bugs rolled into one:
+        //   (a) get_oa() uses the per-vector (delta, v_mi) *lower-edge*
+        //       reconstruction rather than the fixed-grid bucket center
+        //       expected by the formula, so it was off by 0.5*delta*sum(c).
+        //   (b) The caller was passing the un-rotated centroid against
+        //       rotated-space oa, corrupting the dot product when a
+        //       rotator was used (the default).
+        if (centroid && num_bits_ > 0) {
+            const double caq_delta_local = 2.0 / (1 << num_bits_);
+            const double v_nom = -1.0 + caq_delta_local / 2.0;
+            // Compute <c, nominal_r> = caq_delta * <c, code> + v_nom * sum(c)
+            // in double precision to avoid float-summation error on large dims.
+            const Eigen::VectorXd cent_d =
+                    centroid->template cast<double>().transpose();
+            const Eigen::VectorXd code_d = caq.code.template cast<double>();
+            const double ip_c_code = cent_d.dot(code_d);
+            const double sum_c     = cent_d.sum();
+            base_code.ip_cent_oa = static_cast<float>(
+                    caq_delta_local * ip_c_code + v_nom * sum_c);
+        }
         if (num_bits_ > 1) {
-            if (centroid) {
-                base_code.ip_cent_oa = centroid->dot(caq.get_oa());
-            }
             base_code.norm_ip_o_oa = caq.ip_o_oa / caq.o_l2norm / std::sqrt(caq.oa_l2sqr);
         }
 

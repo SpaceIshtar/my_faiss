@@ -91,8 +91,21 @@ class CodeHelper {
         return CodeHelper<8>::compute_ip(query, rec.get(), D);
     }
 
-    // 4-way batched IP: load query once, apply to 4 different codes.
-    // Specializations for bits=0,1,8 override this general fallback.
+    // 4-way batched IP: compute <query, y_k> for k in {0,1,2,3} against four
+    // codes sharing the same query. The point of this routine is not raw FLOPs
+    // (decoding cost is the same as 4×compute_ip), but memory-level parallelism:
+    // issuing four independent code loads per iteration lets the OoO engine
+    // overlap their cache-miss stalls, which is the common case during HNSW
+    // traversal where each code lives on a different cache line.
+    //
+    // Specializations exist for every kBits in [1,8]; each one mirrors the
+    // decoding scheme of the corresponding compute_ip and simply hoists the
+    // query loads and mask constants across the four codes. For kBits>8 we
+    // recurse into CodeHelper<8> (low byte) + CodeHelper<kBits-8> (upper bits),
+    // matching compacted_code16's layout of "D lower bytes then compacted upper".
+    //
+    // IMPORTANT: Do NOT use froce_decompact here — many kBits have specialized
+    // compacted_code8 layouts that differ from the generic bit-interleaved one.
     static void compute_ip_4(
             const float *__restrict__ query,
             const uint8_t *__restrict__ y0,
@@ -114,17 +127,13 @@ class CodeHelper {
             r2 = a2 + 256.0f * b2; r3 = a3 + 256.0f * b3;
             return;
         }
-        // kBits in [1,8]: decompact each code to 8-bit, then batch IP.
-        auto rec0 = memory::make_unique_array<uint8_t>(D, 64);
-        auto rec1 = memory::make_unique_array<uint8_t>(D, 64);
-        auto rec2 = memory::make_unique_array<uint8_t>(D, 64);
-        auto rec3 = memory::make_unique_array<uint8_t>(D, 64);
-        froce_decompact(y0, rec0.get(), D);
-        froce_decompact(y1, rec1.get(), D);
-        froce_decompact(y2, rec2.get(), D);
-        froce_decompact(y3, rec3.get(), D);
-        CodeHelper<8>::compute_ip_4(
-                query, rec0.get(), rec1.get(), rec2.get(), rec3.get(), D, r0, r1, r2, r3);
+        // Unspecialized fallback: 4 sequential compute_ip calls. Correct for any
+        // kBits, but forfeits the memory-level parallelism benefit; every kBits
+        // in [1,8] should have a specialization below.
+        r0 = compute_ip(query, y0, D);
+        r1 = compute_ip(query, y1, D);
+        r2 = compute_ip(query, y2, D);
+        r3 = compute_ip(query, y3, D);
     }
 };
 
@@ -172,7 +181,10 @@ inline float CodeHelper<1>::compute_ip(const float *__restrict__ query, const ui
 #endif
 }
 
-// 4-way specialization for bits=1: load query once, apply 4 bitmasks simultaneously.
+// 4-way specialization for kBits=1.
+// Per 16 query floats we load one __m512, then apply 4 independent 16-bit
+// masks (one per code) via maskz_mov — the query is shared across codes and
+// the four mask-loads/mov/adds expose memory-level parallelism cheaply.
 template <>
 inline void CodeHelper<1>::compute_ip_4(
         const float *__restrict__ query,
@@ -187,20 +199,19 @@ inline void CodeHelper<1>::compute_ip_4(
     __m512 acc1 = _mm512_setzero_ps();
     __m512 acc2 = _mm512_setzero_ps();
     __m512 acc3 = _mm512_setzero_ps();
+
     for (size_t i = 0; i < len; i += 16) {
-        __m512 q = _mm512_loadu_ps(query + i); // loaded once, shared by all 4
-        const uint8_t *m0 = y0 + (i / 8);
-        const uint8_t *m1 = y1 + (i / 8);
-        const uint8_t *m2 = y2 + (i / 8);
-        const uint8_t *m3 = y3 + (i / 8);
-        __mmask16 k0 = _cvtu32_mask16(m0[0] | ((uint32_t)m0[1] << 8));
-        __mmask16 k1 = _cvtu32_mask16(m1[0] | ((uint32_t)m1[1] << 8));
-        __mmask16 k2 = _cvtu32_mask16(m2[0] | ((uint32_t)m2[1] << 8));
-        __mmask16 k3 = _cvtu32_mask16(m3[0] | ((uint32_t)m3[1] << 8));
-        acc0 = _mm512_add_ps(acc0, _mm512_maskz_mov_ps(k0, q));
-        acc1 = _mm512_add_ps(acc1, _mm512_maskz_mov_ps(k1, q));
-        acc2 = _mm512_add_ps(acc2, _mm512_maskz_mov_ps(k2, q));
-        acc3 = _mm512_add_ps(acc3, _mm512_maskz_mov_ps(k3, q));
+        const __m512 q = _mm512_loadu_ps(query + i); // loaded once, shared by all 4
+        auto accumulate = [&](const uint8_t *m, __m512 &acc) {
+            __mmask16 kk = _cvtu32_mask16(
+                    static_cast<uint32_t>(m[0]) | (static_cast<uint32_t>(m[1]) << 8));
+            acc = _mm512_add_ps(acc, _mm512_maskz_mov_ps(kk, q));
+        };
+        const size_t off = i / 8;
+        accumulate(y0 + off, acc0);
+        accumulate(y1 + off, acc1);
+        accumulate(y2 + off, acc2);
+        accumulate(y3 + off, acc3);
     }
     r0 = _mm512_reduce_add_ps(acc0);
     r1 = _mm512_reduce_add_ps(acc1);
@@ -288,6 +299,61 @@ inline float CodeHelper<2>::compute_ip(const float *__restrict__ query, const ui
     result = _mm512_reduce_add_ps(sum);
 
     return result;
+}
+
+// 4-way specialization for kBits=2.
+// Per 64 values, each code stores 16 bytes packing (bit0,bit1) of 64 values.
+// Same decoding as compute_ip, but query loads are hoisted across the 4 codes.
+template <>
+inline void CodeHelper<2>::compute_ip_4(
+        const float *__restrict__ query,
+        const uint8_t *__restrict__ y0,
+        const uint8_t *__restrict__ y1,
+        const uint8_t *__restrict__ y2,
+        const uint8_t *__restrict__ y3,
+        size_t D,
+        float &r0, float &r1, float &r2, float &r3) {
+#if defined(__AVX512F__)
+    __m512 sum0 = _mm512_setzero_ps();
+    __m512 sum1 = _mm512_setzero_ps();
+    __m512 sum2 = _mm512_setzero_ps();
+    __m512 sum3 = _mm512_setzero_ps();
+
+    const __m128i mask = _mm_set1_epi8(0b00000011);
+
+    for (size_t i = 0; i < D; i += 64) {
+        // Shared query loads (4 × 16 floats).
+        const __m512 q0 = _mm512_loadu_ps(&query[i +  0]);
+        const __m512 q1 = _mm512_loadu_ps(&query[i + 16]);
+        const __m512 q2 = _mm512_loadu_ps(&query[i + 32]);
+        const __m512 q3 = _mm512_loadu_ps(&query[i + 48]);
+
+        auto accumulate = [&](const uint8_t *cp, __m512 &acc) {
+            const __m128i cpt = _mm_loadu_si128(reinterpret_cast<const __m128i *>(cp));
+            const __m128i v0 = _mm_and_si128(cpt, mask);
+            const __m128i v1 = _mm_and_si128(_mm_srli_epi16(cpt, 2), mask);
+            const __m128i v2 = _mm_and_si128(_mm_srli_epi16(cpt, 4), mask);
+            const __m128i v3 = _mm_and_si128(_mm_srli_epi16(cpt, 6), mask);
+            acc = _mm512_fmadd_ps(q0, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v0)), acc);
+            acc = _mm512_fmadd_ps(q1, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v1)), acc);
+            acc = _mm512_fmadd_ps(q2, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v2)), acc);
+            acc = _mm512_fmadd_ps(q3, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v3)), acc);
+        };
+
+        const size_t off = i / 4;
+        accumulate(y0 + off, sum0);
+        accumulate(y1 + off, sum1);
+        accumulate(y2 + off, sum2);
+        accumulate(y3 + off, sum3);
+    }
+    r0 = _mm512_reduce_add_ps(sum0);
+    r1 = _mm512_reduce_add_ps(sum1);
+    r2 = _mm512_reduce_add_ps(sum2);
+    r3 = _mm512_reduce_add_ps(sum3);
+#else
+    r0 = compute_ip(query, y0, D); r1 = compute_ip(query, y1, D);
+    r2 = compute_ip(query, y2, D); r3 = compute_ip(query, y3, D);
+#endif
 }
 
 template <>
@@ -396,6 +462,88 @@ inline float CodeHelper<3>::compute_ip(const float *__restrict__ query, const ui
     return result;
 }
 
+// 4-way specialization for kBits=3.
+// Packed layout (see compacted_code8): per 64 values, 16 bytes carry the two
+// low bits (4 values/byte) and 8 bytes carry the top bit in a transposed form
+// where byte j bit k = bit2 of value k*8+j.
+//
+// Strategy: load all 4 codes' compact data up front (to issue 4 independent
+// memory streams early), then for each sub-group load the query once and do
+// 4 decodes/FMADDs — one per code — so all 4 accumulators have independent
+// FMA chains running in parallel.
+template <>
+inline void CodeHelper<3>::compute_ip_4(
+        const float *__restrict__ query,
+        const uint8_t *__restrict__ y0,
+        const uint8_t *__restrict__ y1,
+        const uint8_t *__restrict__ y2,
+        const uint8_t *__restrict__ y3,
+        size_t D,
+        float &r0, float &r1, float &r2, float &r3) {
+#if defined(__AVX512F__)
+    __m512 sum0 = _mm512_setzero_ps();
+    __m512 sum1 = _mm512_setzero_ps();
+    __m512 sum2 = _mm512_setzero_ps();
+    __m512 sum3 = _mm512_setzero_ps();
+
+    const __m128i mask     = _mm_set1_epi8(0b11);
+    const __m128i top_mask = _mm_set1_epi8(0b100);
+
+    auto decode_sub = [&](__m128i cpt, int64_t top, int sg) -> __m128i {
+        switch (sg) {
+        case 0: return _mm_or_si128(
+                _mm_and_si128(_mm_set_epi64x(top << 1, top << 2), top_mask),
+                _mm_and_si128(cpt, mask));
+        case 1: return _mm_or_si128(
+                _mm_and_si128(_mm_set_epi64x(top >> 1, top >> 0), top_mask),
+                _mm_and_si128(_mm_srli_epi16(cpt, 2), mask));
+        case 2: return _mm_or_si128(
+                _mm_and_si128(_mm_set_epi64x(top >> 3, top >> 2), top_mask),
+                _mm_and_si128(_mm_srli_epi16(cpt, 4), mask));
+        default: return _mm_or_si128(
+                _mm_and_si128(_mm_set_epi64x(top >> 5, top >> 4), top_mask),
+                _mm_and_si128(_mm_srli_epi16(cpt, 6), mask));
+        }
+    };
+
+    for (size_t i = 0; i < D; i += 64) {
+        const size_t off = (i / 64) * 24;
+        // Issue 4 independent code-stream loads up front.
+        const __m128i cpt0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y0 + off));
+        const __m128i cpt1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y1 + off));
+        const __m128i cpt2 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y2 + off));
+        const __m128i cpt3 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y3 + off));
+        int64_t top0, top1, top2, top3;
+        std::memcpy(&top0, y0 + off + 16, 8);
+        std::memcpy(&top1, y1 + off + 16, 8);
+        std::memcpy(&top2, y2 + off + 16, 8);
+        std::memcpy(&top3, y3 + off + 16, 8);
+
+        // For each sub-group, load query once and fmadd into all 4 accumulators.
+        // The four FMADDs inside each sub-group are mutually independent
+        // (different accumulators), giving 4-way ILP within and cross-sg chains.
+        for (int sg = 0; sg < 4; ++sg) {
+            const __m512 q = _mm512_loadu_ps(&query[i + sg * 16]);
+            const __m128i v0 = decode_sub(cpt0, top0, sg);
+            const __m128i v1 = decode_sub(cpt1, top1, sg);
+            const __m128i v2 = decode_sub(cpt2, top2, sg);
+            const __m128i v3 = decode_sub(cpt3, top3, sg);
+            sum0 = _mm512_fmadd_ps(q, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v0)), sum0);
+            sum1 = _mm512_fmadd_ps(q, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v1)), sum1);
+            sum2 = _mm512_fmadd_ps(q, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v2)), sum2);
+            sum3 = _mm512_fmadd_ps(q, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v3)), sum3);
+        }
+    }
+    r0 = _mm512_reduce_add_ps(sum0);
+    r1 = _mm512_reduce_add_ps(sum1);
+    r2 = _mm512_reduce_add_ps(sum2);
+    r3 = _mm512_reduce_add_ps(sum3);
+#else
+    r0 = compute_ip(query, y0, D); r1 = compute_ip(query, y1, D);
+    r2 = compute_ip(query, y2, D); r3 = compute_ip(query, y3, D);
+#endif
+}
+
 template <>
 inline void CodeHelper<4>::compacted_code8(uint8_t *o_compact, const uint8_t *o_raw, size_t num_dim) {
     for (size_t j = 0; j < num_dim; j += 32) {
@@ -434,6 +582,54 @@ inline float CodeHelper<4>::compute_ip(const float *__restrict__ x, const uint8_
     return _mm512_reduce_add_ps(sum);
 }
 
+// 4-way specialization for kBits=4.
+// Per 32 values, each code holds 16 bytes packing (lo4|hi4) nibbles.
+// Query chunks x1,x2 are loaded once and shared across the four codes.
+template <>
+inline void CodeHelper<4>::compute_ip_4(
+        const float *__restrict__ query,
+        const uint8_t *__restrict__ y0,
+        const uint8_t *__restrict__ y1,
+        const uint8_t *__restrict__ y2,
+        const uint8_t *__restrict__ y3,
+        size_t D,
+        float &r0, float &r1, float &r2, float &r3) {
+#if defined(__AVX512F__)
+    __m512 sum0 = _mm512_setzero_ps();
+    __m512 sum1 = _mm512_setzero_ps();
+    __m512 sum2 = _mm512_setzero_ps();
+    __m512 sum3 = _mm512_setzero_ps();
+
+    const __m128i mask = _mm_set1_epi8(0b1111);
+
+    for (size_t i = 0; i < D; i += 32) {
+        const __m512 x1 = _mm512_load_ps(&query[i]);
+        const __m512 x2 = _mm512_load_ps(&query[i + 16]);
+
+        auto accumulate = [&](const uint8_t *cp, __m512 &acc) {
+            const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(cp));
+            const __m128i lo = _mm_and_si128(a, mask);
+            const __m128i hi = _mm_and_si128(_mm_srli_epi16(a, 4), mask);
+            acc = _mm512_fmadd_ps(x1, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(lo)), acc);
+            acc = _mm512_fmadd_ps(x2, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(hi)), acc);
+        };
+
+        const size_t off = i / 2;
+        accumulate(y0 + off, sum0);
+        accumulate(y1 + off, sum1);
+        accumulate(y2 + off, sum2);
+        accumulate(y3 + off, sum3);
+    }
+    r0 = _mm512_reduce_add_ps(sum0);
+    r1 = _mm512_reduce_add_ps(sum1);
+    r2 = _mm512_reduce_add_ps(sum2);
+    r3 = _mm512_reduce_add_ps(sum3);
+#else
+    r0 = compute_ip(query, y0, D); r1 = compute_ip(query, y1, D);
+    r2 = compute_ip(query, y2, D); r3 = compute_ip(query, y3, D);
+#endif
+}
+
 template <>
 inline void CodeHelper<5>::compacted_code8(uint8_t *o_compact, const uint8_t *o_raw, size_t num_dim) {
     CodeHelper<1>::compacted_code8(o_compact + (num_dim * 4 / 8), o_raw, num_dim);
@@ -447,6 +643,29 @@ inline void CodeHelper<5>::compacted_code8(uint8_t *o_compact, const uint8_t *o_
 template <>
 inline float CodeHelper<5>::compute_ip(const float *__restrict__ query, const uint8_t *__restrict__ y, size_t D) {
     return 2 * CodeHelper<4>::compute_ip(query, y, D) + CodeHelper<1>::compute_ip(query, y + (D * 4 / 8), D);
+}
+
+// 4-way specialization for kBits=5. Mirrors compute_ip's 4-bit/1-bit split and
+// delegates to the corresponding batch_4 routines so both halves enjoy
+// memory-level parallelism.
+template <>
+inline void CodeHelper<5>::compute_ip_4(
+        const float *__restrict__ query,
+        const uint8_t *__restrict__ y0,
+        const uint8_t *__restrict__ y1,
+        const uint8_t *__restrict__ y2,
+        const uint8_t *__restrict__ y3,
+        size_t D,
+        float &r0, float &r1, float &r2, float &r3) {
+    const size_t off = D * 4 / 8;
+    float a0, a1, a2, a3, b0, b1, b2, b3;
+    CodeHelper<4>::compute_ip_4(query, y0, y1, y2, y3, D, a0, a1, a2, a3);
+    CodeHelper<1>::compute_ip_4(
+            query, y0 + off, y1 + off, y2 + off, y3 + off, D, b0, b1, b2, b3);
+    r0 = 2 * a0 + b0;
+    r1 = 2 * a1 + b1;
+    r2 = 2 * a2 + b2;
+    r3 = 2 * a3 + b3;
 }
 
 template <>
@@ -527,6 +746,85 @@ inline float CodeHelper<6>::compute_ip(const float *__restrict__ query, const ui
     result = _mm512_reduce_add_ps(sum);
 
     return result;
+}
+
+// 4-way specialization for kBits=6.
+// Packed layout: per 64 values → 48 bytes split as three 16-byte blocks cpt1,
+// cpt2, cpt3. sub-group-0 and sub-group-1 take 6 bits directly from cpt1/cpt2;
+// sub-group-2 and sub-group-3 recombine bits from cpt1/cpt2 (high 2) with
+// cpt3 (low 4 + high 4).
+//
+// Strategy mirrors kBits=3: load all four codes' compact bytes up front so
+// the four memory streams can run in parallel, then iterate sub-groups with
+// 4-way independent FMADDs that keep all accumulators busy.
+template <>
+inline void CodeHelper<6>::compute_ip_4(
+        const float *__restrict__ query,
+        const uint8_t *__restrict__ y0,
+        const uint8_t *__restrict__ y1,
+        const uint8_t *__restrict__ y2,
+        const uint8_t *__restrict__ y3,
+        size_t D,
+        float &r0, float &r1, float &r2, float &r3) {
+#if defined(__AVX512F__)
+    __m512 sum0 = _mm512_setzero_ps();
+    __m512 sum1 = _mm512_setzero_ps();
+    __m512 sum2 = _mm512_setzero_ps();
+    __m512 sum3 = _mm512_setzero_ps();
+
+    const __m128i mask6 = _mm_set1_epi8(0b00111111);
+    const __m128i mask2 = _mm_set1_epi8(0b00110000);
+    const __m128i mask4 = _mm_set1_epi8(0b00001111);
+
+    // Decode one code's sub-group `sg` from its three compact blocks.
+    auto decode_sub = [&](__m128i cp1, __m128i cp2, __m128i cp3, int sg) -> __m128i {
+        switch (sg) {
+        case 0: return _mm_and_si128(cp1, mask6);
+        case 1: return _mm_and_si128(cp2, mask6);
+        case 2: return _mm_or_si128(
+                _mm_and_si128(_mm_srli_epi16(cp1, 2), mask2),
+                _mm_and_si128(cp3, mask4));
+        default: return _mm_or_si128(
+                _mm_and_si128(_mm_srli_epi16(cp2, 2), mask2),
+                _mm_and_si128(_mm_srli_epi16(cp3, 4), mask4));
+        }
+    };
+
+    for (size_t i = 0; i < D; i += 64) {
+        const size_t off = (i / 64) * 48;
+        const __m128i a0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y0 + off +  0));
+        const __m128i b0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y0 + off + 16));
+        const __m128i c0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y0 + off + 32));
+        const __m128i a1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y1 + off +  0));
+        const __m128i b1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y1 + off + 16));
+        const __m128i c1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y1 + off + 32));
+        const __m128i a2 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y2 + off +  0));
+        const __m128i b2 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y2 + off + 16));
+        const __m128i c2 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y2 + off + 32));
+        const __m128i a3 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y3 + off +  0));
+        const __m128i b3 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y3 + off + 16));
+        const __m128i c3 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y3 + off + 32));
+
+        for (int sg = 0; sg < 4; ++sg) {
+            const __m512 q = _mm512_loadu_ps(&query[i + sg * 16]);
+            const __m128i v0 = decode_sub(a0, b0, c0, sg);
+            const __m128i v1 = decode_sub(a1, b1, c1, sg);
+            const __m128i v2 = decode_sub(a2, b2, c2, sg);
+            const __m128i v3 = decode_sub(a3, b3, c3, sg);
+            sum0 = _mm512_fmadd_ps(q, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v0)), sum0);
+            sum1 = _mm512_fmadd_ps(q, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v1)), sum1);
+            sum2 = _mm512_fmadd_ps(q, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v2)), sum2);
+            sum3 = _mm512_fmadd_ps(q, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v3)), sum3);
+        }
+    }
+    r0 = _mm512_reduce_add_ps(sum0);
+    r1 = _mm512_reduce_add_ps(sum1);
+    r2 = _mm512_reduce_add_ps(sum2);
+    r3 = _mm512_reduce_add_ps(sum3);
+#else
+    r0 = compute_ip(query, y0, D); r1 = compute_ip(query, y1, D);
+    r2 = compute_ip(query, y2, D); r3 = compute_ip(query, y3, D);
+#endif
 }
 
 template <>
@@ -638,6 +936,101 @@ inline float CodeHelper<7>::compute_ip(const float *__restrict__ query, const ui
     return result;
 }
 
+// 4-way specialization for kBits=7.
+// Packed layout: kBits=6 region (48 bytes) followed by 8 bytes of transposed
+// bit6 (byte j bit k = bit6 of value k*8+j). Same layout strategy as kBits=6
+// — upfront loads of the 4 codes' compact blocks plus top bytes, then a
+// sub-group loop with 4-way independent FMADDs — with the extra top-bit
+// merge on each sub-group.
+template <>
+inline void CodeHelper<7>::compute_ip_4(
+        const float *__restrict__ query,
+        const uint8_t *__restrict__ y0,
+        const uint8_t *__restrict__ y1,
+        const uint8_t *__restrict__ y2,
+        const uint8_t *__restrict__ y3,
+        size_t D,
+        float &r0, float &r1, float &r2, float &r3) {
+#if defined(__AVX512F__)
+    __m512 sum0 = _mm512_setzero_ps();
+    __m512 sum1 = _mm512_setzero_ps();
+    __m512 sum2 = _mm512_setzero_ps();
+    __m512 sum3 = _mm512_setzero_ps();
+
+    const __m128i mask6    = _mm_set1_epi8(0b00111111);
+    const __m128i mask2    = _mm_set1_epi8(0b00110000);
+    const __m128i mask4    = _mm_set1_epi8(0b00001111);
+    const __m128i top_mask = _mm_set1_epi8(0b1000000);
+
+    auto decode_sub = [&](__m128i cp1, __m128i cp2, __m128i cp3, int64_t top, int sg) -> __m128i {
+        __m128i base, tb;
+        switch (sg) {
+        case 0:
+            base = _mm_and_si128(cp1, mask6);
+            tb   = _mm_and_si128(_mm_set_epi64x(top << 5, top << 6), top_mask);
+            break;
+        case 1:
+            base = _mm_and_si128(cp2, mask6);
+            tb   = _mm_and_si128(_mm_set_epi64x(top << 3, top << 4), top_mask);
+            break;
+        case 2:
+            base = _mm_or_si128(
+                    _mm_and_si128(_mm_srli_epi16(cp1, 2), mask2),
+                    _mm_and_si128(cp3, mask4));
+            tb   = _mm_and_si128(_mm_set_epi64x(top << 1, top << 2), top_mask);
+            break;
+        default:
+            base = _mm_or_si128(
+                    _mm_and_si128(_mm_srli_epi16(cp2, 2), mask2),
+                    _mm_and_si128(_mm_srli_epi16(cp3, 4), mask4));
+            tb   = _mm_and_si128(_mm_set_epi64x(top >> 1, top << 0), top_mask);
+            break;
+        }
+        return _mm_or_si128(tb, base);
+    };
+
+    for (size_t i = 0; i < D; i += 64) {
+        const size_t off = (i / 64) * 56;
+        const __m128i a0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y0 + off +  0));
+        const __m128i b0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y0 + off + 16));
+        const __m128i c0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y0 + off + 32));
+        const __m128i a1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y1 + off +  0));
+        const __m128i b1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y1 + off + 16));
+        const __m128i c1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y1 + off + 32));
+        const __m128i a2 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y2 + off +  0));
+        const __m128i b2 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y2 + off + 16));
+        const __m128i c2 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y2 + off + 32));
+        const __m128i a3 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y3 + off +  0));
+        const __m128i b3 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y3 + off + 16));
+        const __m128i c3 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(y3 + off + 32));
+        int64_t top0, top1, top2, top3;
+        std::memcpy(&top0, y0 + off + 48, 8);
+        std::memcpy(&top1, y1 + off + 48, 8);
+        std::memcpy(&top2, y2 + off + 48, 8);
+        std::memcpy(&top3, y3 + off + 48, 8);
+
+        for (int sg = 0; sg < 4; ++sg) {
+            const __m512 q = _mm512_loadu_ps(&query[i + sg * 16]);
+            const __m128i v0 = decode_sub(a0, b0, c0, top0, sg);
+            const __m128i v1 = decode_sub(a1, b1, c1, top1, sg);
+            const __m128i v2 = decode_sub(a2, b2, c2, top2, sg);
+            const __m128i v3 = decode_sub(a3, b3, c3, top3, sg);
+            sum0 = _mm512_fmadd_ps(q, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v0)), sum0);
+            sum1 = _mm512_fmadd_ps(q, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v1)), sum1);
+            sum2 = _mm512_fmadd_ps(q, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v2)), sum2);
+            sum3 = _mm512_fmadd_ps(q, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v3)), sum3);
+        }
+    }
+    r0 = _mm512_reduce_add_ps(sum0);
+    r1 = _mm512_reduce_add_ps(sum1);
+    r2 = _mm512_reduce_add_ps(sum2);
+    r3 = _mm512_reduce_add_ps(sum3);
+#else
+    r0 = compute_ip(query, y0, D); r1 = compute_ip(query, y1, D);
+    r2 = compute_ip(query, y2, D); r3 = compute_ip(query, y3, D);
+#endif
+}
+
 template <>
 inline void CodeHelper<8>::compacted_code8(uint8_t *o_compact, const uint8_t *o_raw, size_t num_dim) {
     std::memcpy(o_compact, o_raw, sizeof(uint8_t) * num_dim);
@@ -666,7 +1059,12 @@ inline float CodeHelper<8>::compute_ip(const float *__restrict__ x, const uint8_
     return result;
 }
 
-// 4-way specialization for bits=8: load query once, fmadd against 4 uint8 code arrays.
+// 4-way specialization for kBits=8.
+// Each 16-float query chunk is loaded once and fed to all 4 codes. The 4
+// FMADDs within each iteration target distinct accumulators, so they are
+// mutually independent and the OoO engine happily schedules them on the
+// two FMA ports. Keep the structure simple — one accumulator per code is
+// enough here because there is no decoding overhead to hide.
 template <>
 inline void CodeHelper<8>::compute_ip_4(
         const float *__restrict__ query,
@@ -681,20 +1079,18 @@ inline void CodeHelper<8>::compute_ip_4(
     __m512 sum1 = _mm512_setzero_ps();
     __m512 sum2 = _mm512_setzero_ps();
     __m512 sum3 = _mm512_setzero_ps();
+
+    auto load_u8_to_ps = [](const uint8_t *p) {
+        return _mm512_cvtepi32_ps(
+                _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i *>(p))));
+    };
+
     for (size_t i = 0; i < D; i += 16) {
-        __m512 xx = _mm512_load_ps(&query[i]); // loaded once, shared by all 4
-        sum0 = _mm512_fmadd_ps(
-                xx, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
-                    _mm_loadu_si128((const __m128i *)&y0[i]))), sum0);
-        sum1 = _mm512_fmadd_ps(
-                xx, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
-                    _mm_loadu_si128((const __m128i *)&y1[i]))), sum1);
-        sum2 = _mm512_fmadd_ps(
-                xx, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
-                    _mm_loadu_si128((const __m128i *)&y2[i]))), sum2);
-        sum3 = _mm512_fmadd_ps(
-                xx, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
-                    _mm_loadu_si128((const __m128i *)&y3[i]))), sum3);
+        const __m512 q = _mm512_load_ps(&query[i]); // loaded once, shared by all 4
+        sum0 = _mm512_fmadd_ps(q, load_u8_to_ps(&y0[i]), sum0);
+        sum1 = _mm512_fmadd_ps(q, load_u8_to_ps(&y1[i]), sum1);
+        sum2 = _mm512_fmadd_ps(q, load_u8_to_ps(&y2[i]), sum2);
+        sum3 = _mm512_fmadd_ps(q, load_u8_to_ps(&y3[i]), sum3);
     }
     r0 = _mm512_reduce_add_ps(sum0);
     r1 = _mm512_reduce_add_ps(sum1);
