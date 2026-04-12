@@ -21,7 +21,6 @@
 #include "utils/code_helper.hpp"
 #include "utils/memory.hpp"
 
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -45,18 +44,18 @@
 namespace hnsw_bench {
 
 // =====================================================================
-// Per-vector flat blob layout (mirrors RaBitQ's per-vec contiguous blob)
+// Per-vector flat blob layout
 //
-//   [  0, 4)            cluster_id  (u32)
+//   [  0, 4)            cluster_id (u32)
 //   [  4, 8)            padding
-//   [  8, 8+12*n_segs)  per-segment factors: {o_l2norm, ip_cent_oa, rescale}
-//   [ ... ]             per-segment codes (concatenated, 16-byte aligned)
-//   padded to 64-byte stride
+//   [  8, 8 + 12*n_segs)  per-segment factors {o_l2norm, ip_cent_oa, rescale}
+//   [ ... ]             per-segment canonical N-bit codes
+//                       (concatenated, each segment 16-byte aligned)
+//   padded up to 64-byte stride
 //
-// One distance computation touches exactly one contiguous slot, no
-// separate arrays for short_factors / short_code / long_code /
-// long_factors. This matches bench_hnsw_rabitq_native.cpp's codes_
-// layout and is the layout that closes the text2image 2× gap.
+// A single distance computation reads exactly one contiguous slot;
+// per-segment factors and code bytes live side-by-side and share the
+// same stride.
 // =====================================================================
 
 class SAQWrapper;
@@ -90,10 +89,10 @@ class SAQDistanceComputer : public faiss::DistanceComputer {
     std::vector<saqlib::FloatVec> q_rot_per_seg_;
     std::vector<float> sum_q_per_seg_;
 
-    // Lazy per-cluster total ||q - c||² = Σ_s ||q_s - c_s||². Computed on
-    // first visit for a given query. query_gen_ bumps on every set_query
-    // and cluster_gen_[cid] tracks which query generation the cached value
-    // was computed for, so we never need to re-zero the array.
+    // Per-cluster total ||q - c||² = Σ_s ||q_s - c_s||², computed lazily
+    // on first visit for a given query. cluster_gen_[cid] records which
+    // query generation the cached value belongs to, so the cache stays
+    // valid across queries without ever being explicitly cleared.
     uint32_t query_gen_ = 0;
     std::vector<uint32_t> cluster_gen_;
     std::vector<float> q_minus_c_total_;  // size = num_clusters
@@ -167,8 +166,7 @@ class SAQWrapper : public QuantWrapper {
         cfg.seg_eqseg = seg_eqseg_;
         cfg.use_compact_layout = use_compact_layout_;
         cfg.single.random_rotation = random_rotation_;
-        cfg.single.use_fastscan = true;  // kept for SaqData compatibility;
-                                         // hot path ignores fastscan entirely.
+        cfg.single.use_fastscan = true;
 
         saqlib::SaqDataMaker data_maker(cfg, d_);
         saqlib::FloatRowMat padded_data(n, data_maker.getPaddedDim());
@@ -329,7 +327,7 @@ class SAQWrapper : public QuantWrapper {
         }
 
         const uint64_t magic = 0x5341515752415050ULL;  // SAQWRAPP
-        const uint64_t version = 2;                    // blob layout
+        const uint64_t version = 2;
         ofs.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
         ofs.write(reinterpret_cast<const char*>(&version), sizeof(version));
 
@@ -376,7 +374,6 @@ class SAQWrapper : public QuantWrapper {
         ifs.read(reinterpret_cast<char*>(&magic), sizeof(magic));
         ifs.read(reinterpret_cast<char*>(&version), sizeof(version));
         if (magic != 0x5341515752415050ULL || version != 2) {
-            // Version 1 (cluster_data layout) is no longer supported.
             return false;
         }
 
@@ -464,18 +461,15 @@ class SAQWrapper : public QuantWrapper {
         saqlib::utils::IP_FUNC_4_t ip_func_4;
     };
 
-    // Inline per-vec, per-seg *partial* distance contribution (no
-    // per-cluster term). The total distance formula is
+    // Per-segment partial distance contribution. Excludes the per-
+    // cluster ||q - c||² term, which is added once per vector outside
+    // the segment loop.
     //
-    //   dist = ||q - c||² + Σ_s [ o_l2sqr_s - 2 * rescale_s * (ext_s - icn_s) ]
+    //   ext_s  = caq_delta_s * <q_rot_s, code> + v_nom_s * sum_q_s
+    //          ≈ <q_rot_s, nominal_r_s>
+    //   part_s = o_l2sqr_s - 2 * rescale_s * (ext_s - icn_s)
     //
-    // where the second term is one call per segment per vec. ||q - c||²
-    // is added ONCE per vec outside the segment loop (fetched lazily from
-    // q_minus_c_total_ in the DistanceComputer).
-    //
-    //   ext_s    = caq_delta_s * <q_rot_s, code> + v_nom_s * sum_q_s
-    //              ≈ <q_rot_s, nominal_r_s>
-    //   part_s   = o_l2sqr_s - 2 * rescale_s * (ext_s - icn_s)
+    // Full distance: ||q - c||² + Σ_s part_s.
     static inline float seg_partial_from_ip(
             const SegLayout& seg,
             const uint8_t* slot,
@@ -601,7 +595,6 @@ class SAQWrapper : public QuantWrapper {
 // SAQDistanceComputer implementation
 // ---------------------------------------------------------------------
 
-
 inline void SAQDistanceComputer::set_query(const float* x) {
     const size_t n_segs = parent_->n_segs_;
     const size_t num_clusters = parent_->num_clusters_;
@@ -624,18 +617,16 @@ inline void SAQDistanceComputer::set_query(const float* x) {
         sum_q_per_seg_[s] = q_rot_per_seg_[s].sum();
     }
 
-    // Bump query generation. The lazy get_q_minus_c_total_ path recomputes
-    // any cluster whose cluster_gen_[cid] doesn't match. We never re-zero
-    // the arrays, so set_query stays O(n_segs * padded_dim) rather than
-    // O(num_clusters * padded_dim) — a huge win on HNSW where we only
-    // visit a tiny fraction of clusters per query.
+    // Bump query generation. get_q_minus_c_total_ uses cluster_gen_[cid]
+    // to decide whether the cached value is fresh for this query, which
+    // avoids re-zeroing num_clusters entries on every set_query.
     if (cluster_gen_.size() != num_clusters) {
         cluster_gen_.assign(num_clusters, 0);
         q_minus_c_total_.assign(num_clusters, 0.0f);
     }
     ++query_gen_;
     if (query_gen_ == 0) {
-        // wrap-around: force recompute by resetting all gens
+        // Counter wrap-around: reset all generations and restart.
         std::fill(cluster_gen_.begin(), cluster_gen_.end(), 0);
         query_gen_ = 1;
     }
@@ -655,11 +646,11 @@ inline float SAQDistanceComputer::get_q_minus_c_total_(uint32_t cid) {
         const float* q = q_rot_per_seg_[s].data();
         const size_t D = seg.num_dim_pad;
 
-        // Opt 1: AVX-512 SIMD. D is always a multiple of
-        // saqlib::kDimPaddingSize (=64), enforced in SaqDataMaker, so no
-        // tail handling is needed. FP associativity prevents auto-vec
-        // of the scalar version on a raw `sub += d*d;` reduction, so we
-        // do it by hand to get a guaranteed 16-way FMA chain.
+        // num_dim_pad is always a multiple of saqlib::kDimPaddingSize (= 64),
+        // enforced in SaqDataMaker, so no scalar tail is needed.
+        // FP non-associativity blocks auto-vectorization of a scalar
+        // sum-of-squares reduction, so the 16-way FMA chain is issued
+        // explicitly.
         __m512 acc_vec = _mm512_setzero_ps();
         for (size_t j = 0; j < D; j += 16) {
             __m512 qv = _mm512_loadu_ps(q + j);
@@ -697,9 +688,7 @@ inline float SAQDistanceComputer::operator()(faiss::idx_t i) {
         dist += SAQWrapper::seg_partial_from_ip(
                 seg, slot, ip_q_code, sum_q_per_seg_[s]);
     }
-    // Opt 5: drop isfinite — inputs are always finite (CAQEncoder guards
-    // against fac_rescale=0 / ext_eq_icn degeneracies at caq_encoder.hpp:227).
-    // std::max compiles to branchless maxss.
+    // Clamp to a non-negative L2² value; compiles to a branchless maxss.
     return std::max(0.0f, dist);
 }
 
@@ -729,8 +718,8 @@ inline void SAQDistanceComputer::distances_batch_4(
         cids[k] = *reinterpret_cast<const uint32_t*>(slots[k]);
     }
 
-    // Per-cluster ||q - c||² once per vec (lazy, cached across vecs in the
-    // same cluster via cluster_gen_).
+    // Per-cluster ||q - c||² once per vector (cached across vectors in
+    // the same cluster via cluster_gen_).
     float dis[4];
     for (int k = 0; k < 4; ++k) {
         dis[k] = get_q_minus_c_total_(cids[k]);
@@ -766,7 +755,6 @@ inline void SAQDistanceComputer::distances_batch_4(
         }
     }
 
-    // Opt 5: drop isfinite (inputs are always finite), keep branchless max.
     dis0 = std::max(0.0f, dis[0]);
     dis1 = std::max(0.0f, dis[1]);
     dis2 = std::max(0.0f, dis[2]);
