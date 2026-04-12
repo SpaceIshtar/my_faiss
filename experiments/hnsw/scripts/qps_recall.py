@@ -18,7 +18,7 @@ matplotlib.rcParams.update({
 })
 
 # ── Configuration ──────────────────────────────────────────────
-DATASET = "sift1M"
+DATASET = "text2image"
 ALGORITHMS = {
     "Standard": "standard",
     "PQ": "pq",
@@ -27,17 +27,17 @@ ALGORITHMS = {
     "RaBitQ-Native": "rabitq_native",
     "OPQ": "opq",
     "OSQ": "osq",
-    "VAQ": "vaq",
-    "RQ": "rq",
-    "PQR": "prq",
-    "LSQ": "lsq",
-    "PLSQ": "plsq",
+    # "VAQ": "vaq",
+    # "RQ": "rq",
+    # "PQR": "prq",
+    # "LSQ": "lsq",
+    # "PLSQ": "plsq",
     "SAQ": "saq",
     "TurboQuant": "turboquant",
 }
 TARGET_RECALL = 0.95
-RECALL_THRESHOLD = 0.90  # points with recall < this value are not plotted
-NAME = "sift1M_qps_recall_0.95.pdf"
+RECALL_THRESHOLD = 0.40  # points with recall < this value are not plotted
+NAME = DATASET + "_qps_recall_"+ str(TARGET_RECALL)+".pdf"
 
 # ── Paths ──────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -153,7 +153,7 @@ if legend_handles:
     legend = fig_leg.legend(
         handles=legend_handles,
         loc="center",
-        ncol=5,
+        ncol=6,
         frameon=False,
         fontsize=12,
     )

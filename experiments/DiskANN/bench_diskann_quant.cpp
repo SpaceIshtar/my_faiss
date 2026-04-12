@@ -310,6 +310,7 @@ struct BenchmarkResult {
     double latency_ms;
     double total_time_ms;
     SearchStats stats;
+    double quant_ratio = 0.0; // fraction of per-query time spent in quantization distance computation
 };
 
 template <typename T>
@@ -329,22 +330,28 @@ std::vector<BenchmarkResult> run_benchmark(
     std::vector<BenchmarkResult> results;
     Timer timer;
 
+    int threads_cnt = omp_get_max_threads();
+    std::vector<uint64_t> warmup_ids(threads_cnt * k);
+    std::vector<float> warmup_dists(threads_cnt * k);
+
+    // Warmup
+    size_t warmup_n = nq;
+    #pragma omp parallel for
+    for (size_t i = 0; i < warmup_n; i++) {
+        size_t thread_id = omp_get_thread_num();
+        flash_index->cached_beam_search(
+            xq + i * d, k, k,
+            warmup_ids.data() + thread_id * k,
+            warmup_dists.data() + thread_id * k,
+            beam_width, false, nullptr);
+    }
+
     for (uint32_t L : L_values) {
         if (L < k) continue;
 
         std::vector<uint64_t> result_ids(nq * k);
         std::vector<float> result_dists(nq * k);
         std::vector<diskann::QueryStats> query_stats(nq);
-
-        // Warmup
-        size_t warmup_n = std::min((size_t)100, nq);
-        for (size_t i = 0; i < warmup_n; i++) {
-            flash_index->cached_beam_search(
-                xq + i * d, k, L,
-                result_ids.data() + i * k,
-                result_dists.data() + i * k,
-                beam_width, false, nullptr);
-        }
 
         // Reset stats
         std::memset(query_stats.data(), 0, nq * sizeof(diskann::QueryStats));
@@ -368,15 +375,19 @@ std::vector<BenchmarkResult> run_benchmark(
 
         // Aggregate ndis/nhop statistics
         std::vector<size_t> ndis_values(nq), nhop_values(nq);
+        double total_quant_us = 0.0, total_query_us = 0.0;
         for (size_t i = 0; i < nq; i++) {
             ndis_values[i] = query_stats[i].n_cmps;
             nhop_values[i] = query_stats[i].n_hops;
+            total_quant_us += query_stats[i].quant_us;
+            total_query_us += query_stats[i].total_us;
         }
         SearchStats ss;
         ss.ndis_stats = compute_percentile_stats(ndis_values);
         ss.nhops_stats = compute_percentile_stats(nhop_values);
+        double quant_ratio = (total_query_us > 0.0) ? (total_quant_us / total_query_us) : 0.0;
 
-        results.push_back({L, qps, recall, latency, search_time, ss});
+        results.push_back({L, qps, recall, latency, search_time, ss, quant_ratio});
 
         if (verbose) {
             std::cout << std::setw(8) << L
@@ -385,6 +396,7 @@ std::vector<BenchmarkResult> run_benchmark(
                       << std::setw(12) << std::setprecision(3) << latency
                       << std::setw(12) << std::setprecision(1) << ss.ndis_stats.mean
                       << std::setw(12) << std::setprecision(1) << ss.nhops_stats.mean
+                      << std::setw(12) << std::setprecision(2) << (quant_ratio * 100.0) << "%"
                       << std::endl;
         }
     }
@@ -458,8 +470,9 @@ void save_results_to_file(
         << std::setw(12) << "Latency(ms)"
         << std::setw(12) << "ndis_mean"
         << std::setw(12) << "nhops_mean"
+        << std::setw(13) << "quant_ratio%"
         << "\n"
-        << std::string(68, '-') << "\n";
+        << std::string(81, '-') << "\n";
 
     for (const auto& r : results) {
         ofs << std::setw(8) << r.L
@@ -468,6 +481,7 @@ void save_results_to_file(
             << std::setw(12) << std::setprecision(3) << r.latency_ms
             << std::setw(12) << std::setprecision(1) << r.stats.ndis_stats.mean
             << std::setw(12) << std::setprecision(1) << r.stats.nhops_stats.mean
+            << std::setw(12) << std::setprecision(2) << (r.quant_ratio * 100.0) << "%"
             << "\n";
     }
     ofs << "\n";
@@ -479,7 +493,8 @@ void save_results_to_file(
             << "  QPS:          " << std::fixed << std::setprecision(2) << r.qps << "\n"
             << "  Recall@" << k << ":    " << std::setprecision(4) << r.recall << "\n"
             << "  Total Time:   " << std::setprecision(2) << r.total_time_ms << " ms\n"
-            << "  Avg Latency:  " << std::setprecision(4) << r.latency_ms << " ms\n";
+            << "  Avg Latency:  " << std::setprecision(4) << r.latency_ms << " ms\n"
+            << "  Quant Ratio:  " << std::setprecision(2) << (r.quant_ratio * 100.0) << "% (quantization dist in per-query time)\n";
         print_percentile_stats(ofs, "ndis (distance computations)", r.stats.ndis_stats);
         print_percentile_stats(ofs, "nhops (graph hops)", r.stats.nhops_stats);
     }
@@ -951,8 +966,9 @@ int main(int argc, char** argv) {
                       << std::setw(12) << "Recall@" << ds_cfg.k
                       << std::setw(12) << "Latency(ms)"
                       << std::setw(12) << "ndis_mean"
-                      << std::setw(12) << "nhops_mean" << std::endl;
-            std::cout << std::string(68, '-') << std::endl;
+                      << std::setw(12) << "nhops_mean"
+                      << std::setw(13) << "quant_ratio%" << std::endl;
+            std::cout << std::string(81, '-') << std::endl;
 
             auto results = run_benchmark(
                 flash_index.get(), xq, nq, d, gt, gt_k, ds_cfg.k,

@@ -1558,7 +1558,9 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             if (stats != nullptr)
             {
                 stats->n_cmps += (uint32_t)nnbrs;
-                stats->cpu_us += (float)cpu_timer.elapsed();
+                float elapsed = (float)cpu_timer.elapsed();
+                stats->cpu_us += elapsed;
+                stats->quant_us += elapsed;
             }
 
             // process prefetched nhood
@@ -1620,7 +1622,9 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             if (stats != nullptr)
             {
                 stats->n_cmps += (uint32_t)nnbrs;
-                stats->cpu_us += (float)cpu_timer.elapsed();
+                float elapsed = (float)cpu_timer.elapsed();
+                stats->cpu_us += elapsed;
+                stats->quant_us += elapsed;
             }
 
             cpu_timer.reset();

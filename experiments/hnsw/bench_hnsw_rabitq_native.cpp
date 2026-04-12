@@ -465,6 +465,15 @@ QueryStats1 rabitq_native_search(
 
     float dist_bound = ep_est;
 
+    // Fixed-size stack buffers reused across while-loop iterations.
+    // kMaxNbr=256 covers HNSW max degree (2*M) for any reasonable M.
+    static constexpr size_t kMaxNbr = 256;
+    faiss::HNSW::storage_idx_t nbr_ids[kMaxNbr];
+    float nbr_est[kMaxNbr];
+    float nbr_low[kMaxNbr];
+    bool  nbr_should_add[kMaxNbr];
+    size_t full_pos[kMaxNbr];
+
     while (!candidates.empty()) {
         SearchResult curr = candidates.top();
         candidates.pop();
@@ -478,34 +487,138 @@ QueryStats1 rabitq_native_search(
         size_t begin, end;
         hnsw.neighbor_range(curr.id, 0, &begin, &end);
 
+        // ------------------------------------------------------------------
+        // Batch-4 neighbour processing
+        //
+        // Phase 1: collect unvisited neighbours
+        // Phase 2: 1-bit estimates in groups of 4 (scalar tail for remainder)
+        // Phase 3: decide who needs a full estimate; collect their indices
+        // Phase 4: full estimates in groups of 4 (scalar tail for remainder)
+        // Phase 5: push to candidates / topk with (possibly updated) values
+        //
+        // Note: dist_bound is snapshotted before the batch.  It may be
+        // slightly stale within a batch, which is the standard trade-off
+        // for HNSW batch implementations and does not affect correctness.
+        // ------------------------------------------------------------------
+
+        size_t nvalid = 0;
+
+        // Phase 1: collect + mark visited
         for (size_t j = begin; j < end; j++) {
-            faiss::HNSW::storage_idx_t neighbor = hnsw.neighbors[j];
-            if (neighbor < 0) break;
-            if (vt.get(neighbor)) continue;
-            vt.set(neighbor);
-
+            faiss::HNSW::storage_idx_t nbr = hnsw.neighbors[j];
+            if (nbr < 0) break;
+            if (vt.get(nbr)) continue;
+            vt.set(nbr);
             stats.nhops++;
+            nbr_ids[nvalid++] = nbr;
+        }
 
-            // First, get 1-bit estimate
-            float n_est, n_low, n_ip;
-            get_estimate(neighbor, n_est, n_low, n_ip);
+        // Phase 2: 1-bit estimates
+        {
+            auto ga_ge = [&](faiss::idx_t id, float& g_add, float& g_err) {
+                float norm = q_to_centroids[rabitq->get_cluster_id(id)];
+                g_add = norm * norm;
+                g_err = norm;
+            };
 
-            // Key optimization: only compute full estimate if low_dist < bound
-            bool should_add_to_topk = (topk_heap.size() < ef) || (n_low < dist_bound);
+            const size_t b4 = (nvalid / 4) * 4;
+            for (size_t i = 0; i < b4; i += 4) {
+                float ga0, ge0, ga1, ge1, ga2, ge2, ga3, ge3;
+                ga_ge(nbr_ids[i+0], ga0, ge0);
+                ga_ge(nbr_ids[i+1], ga1, ge1);
+                ga_ge(nbr_ids[i+2], ga2, ge2);
+                ga_ge(nbr_ids[i+3], ga3, ge3);
+                rabitqlib::split_single_estdist_4(
+                    rabitq->get_code(nbr_ids[i+0]), ga0, ge0,
+                    rabitq->get_code(nbr_ids[i+1]), ga1, ge1,
+                    rabitq->get_code(nbr_ids[i+2]), ga2, ge2,
+                    rabitq->get_code(nbr_ids[i+3]), ga3, ge3,
+                    query_wrapper, padded_dim,
+                    nbr_est[i+0], nbr_low[i+0],
+                    nbr_est[i+1], nbr_low[i+1],
+                    nbr_est[i+2], nbr_low[i+2],
+                    nbr_est[i+3], nbr_low[i+3]);
+            }
+            stats.ndis1 += b4;
 
-            if (should_add_to_topk && ex_bits > 0) {
-                // Compute full estimate only when promising
-                get_full_estimate(neighbor, n_ip, n_est, n_low);
+            for (size_t i = b4; i < nvalid; i++) {
+                float ip_unused;
+                float norm = q_to_centroids[rabitq->get_cluster_id(nbr_ids[i])];
+                rabitqlib::split_single_estdist(
+                    rabitq->get_code(nbr_ids[i]), query_wrapper, padded_dim,
+                    ip_unused, nbr_est[i], nbr_low[i], norm * norm, norm);
+                stats.ndis1++;
+            }
+        }
+
+        // Phase 3: decide who needs full estimate; collect their positions
+        size_t nfull = 0;
+        for (size_t i = 0; i < nvalid; i++) {
+            nbr_should_add[i] = (topk_heap.size() < ef) || (nbr_low[i] < dist_bound);
+            if (nbr_should_add[i] && ex_bits > 0) {
+                full_pos[nfull++] = i;
+            }
+        }
+
+        // Phase 4: full estimates (only when ex_bits > 0)
+        if (ex_bits > 0 && nfull > 0) {
+            auto code_parts = [&](size_t pos,
+                                  const char*& bin, const char*& ex,
+                                  float& ga, float& ge) {
+                faiss::idx_t id = nbr_ids[pos];
+                const char* code = rabitq->get_code(id);
+                bin = code;
+                ex  = code + rabitq->bin_data_size();
+                float norm = q_to_centroids[rabitq->get_cluster_id(id)];
+                ga = norm * norm;
+                ge = norm;
+            };
+
+            const size_t fb4 = (nfull / 4) * 4;
+            for (size_t i = 0; i < fb4; i += 4) {
+                const char *b0, *e0, *b1, *e1, *b2, *e2, *b3, *e3;
+                float ga0, ge0, ga1, ge1, ga2, ge2, ga3, ge3;
+                code_parts(full_pos[i+0], b0, e0, ga0, ge0);
+                code_parts(full_pos[i+1], b1, e1, ga1, ge1);
+                code_parts(full_pos[i+2], b2, e2, ga2, ge2);
+                code_parts(full_pos[i+3], b3, e3, ga3, ge3);
+                rabitqlib::split_single_fulldist_4(
+                    b0, e0, ga0, ge0,
+                    b1, e1, ga1, ge1,
+                    b2, e2, ga2, ge2,
+                    b3, e3, ga3, ge3,
+                    rabitq->ip_func(), query_wrapper, padded_dim, ex_bits,
+                    nbr_est[full_pos[i+0]], nbr_low[full_pos[i+0]],
+                    nbr_est[full_pos[i+1]], nbr_low[full_pos[i+1]],
+                    nbr_est[full_pos[i+2]], nbr_low[full_pos[i+2]],
+                    nbr_est[full_pos[i+3]], nbr_low[full_pos[i+3]]);
+                stats.ndis2 += 4;
             }
 
-            // Add to candidates if promising
+            for (size_t i = fb4; i < nfull; i++) {
+                size_t p = full_pos[i];
+                const char *bin, *ex;
+                float ga, ge, ip_unused;
+                code_parts(p, bin, ex, ga, ge);
+                rabitqlib::split_single_fulldist(
+                    bin, ex, rabitq->ip_func(), query_wrapper, padded_dim,
+                    ex_bits, nbr_est[p], nbr_low[p], ip_unused, ga, ge);
+                stats.ndis2++;
+            }
+        }
+
+        // Phase 5: update candidates and topk
+        for (size_t i = 0; i < nvalid; i++) {
+            float n_est = nbr_est[i];
+            float n_low = nbr_low[i];
+            faiss::HNSW::storage_idx_t nbr = nbr_ids[i];
+
             if (candidates.size() < ef || n_est < dist_bound) {
-                candidates.push({n_est, n_low, neighbor});
+                candidates.push({n_est, n_low, nbr});
             }
 
-            // Update top-k
-            if (should_add_to_topk) {
-                topk_heap.push({n_est, n_low, neighbor});
+            if (nbr_should_add[i]) {
+                topk_heap.push({n_est, n_low, nbr});
                 if (topk_heap.size() > ef) {
                     topk_heap.pop();
                 }
