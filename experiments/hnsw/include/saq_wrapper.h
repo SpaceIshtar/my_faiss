@@ -15,17 +15,19 @@
 #include <faiss/impl/DistanceComputer.h>
 
 #include "defines.hpp"
-#include "quantization/cluster_data.hpp"
+#include "quantization/caq/caq_encoder.hpp"
 #include "quantization/config.h"
 #include "quantization/saq_data.hpp"
-#include "quantization/saq_estimator.hpp"
-#include "quantization/saq_quantizer.hpp"
+#include "utils/code_helper.hpp"
+#include "utils/memory.hpp"
 
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -42,20 +44,28 @@
 
 namespace hnsw_bench {
 
+// =====================================================================
+// Per-vector flat blob layout (mirrors RaBitQ's per-vec contiguous blob)
+//
+//   [  0, 4)            cluster_id  (u32)
+//   [  4, 8)            padding
+//   [  8, 8+12*n_segs)  per-segment factors: {o_l2norm, ip_cent_oa, rescale}
+//   [ ... ]             per-segment codes (concatenated, 16-byte aligned)
+//   padded to 64-byte stride
+//
+// One distance computation touches exactly one contiguous slot, no
+// separate arrays for short_factors / short_code / long_code /
+// long_factors. This matches bench_hnsw_rabitq_native.cpp's codes_
+// layout and is the layout that closes the text2image 2× gap.
+// =====================================================================
+
 class SAQWrapper;
 
 class SAQDistanceComputer : public faiss::DistanceComputer {
-   public:
-    using FastEstimator = saqlib::SaqCluEstimator<saqlib::DistType::L2Sqr>;
-
-    explicit SAQDistanceComputer(const SAQWrapper* parent)
-            : parent_(parent) {
-        searcher_cfg_.dist_type = saqlib::DistType::L2Sqr;
-        searcher_cfg_.searcher_vars_bound_m = 4.0f;
-    }
+  public:
+    explicit SAQDistanceComputer(const SAQWrapper* parent) : parent_(parent) {}
 
     void set_query(const float* x) override;
-
     float operator()(faiss::idx_t i) override;
 
     void distances_batch_4(
@@ -72,17 +82,27 @@ class SAQDistanceComputer : public faiss::DistanceComputer {
         throw std::runtime_error("SAQDistanceComputer::symmetric_dis not implemented");
     }
 
-   private:
+  private:
     const SAQWrapper* parent_;
-    saqlib::SearcherConfig searcher_cfg_;
-    saqlib::FloatVec query_;
-    std::unique_ptr<FastEstimator> fast_estimator_;
-    uint32_t prepared_cluster_ = std::numeric_limits<uint32_t>::max();
-    uint32_t prepared_block_ = std::numeric_limits<uint32_t>::max();
+
+    // Per-segment rotated query (q_rot[s]) and its running sum. Contiguous
+    // storage is kept per-segment because each segment's padded_dim differs.
+    std::vector<saqlib::FloatVec> q_rot_per_seg_;
+    std::vector<float> sum_q_per_seg_;
+
+    // Lazy per-cluster total ||q - c||² = Σ_s ||q_s - c_s||². Computed on
+    // first visit for a given query. query_gen_ bumps on every set_query
+    // and cluster_gen_[cid] tracks which query generation the cached value
+    // was computed for, so we never need to re-zero the array.
+    uint32_t query_gen_ = 0;
+    std::vector<uint32_t> cluster_gen_;
+    std::vector<float> q_minus_c_total_;  // size = num_clusters
+
+    inline float get_q_minus_c_total_(uint32_t cid);
 };
 
 class SAQWrapper : public QuantWrapper {
-   public:
+  public:
     SAQWrapper(
             size_t d,
             float avg_bits = 4.0f,
@@ -119,7 +139,7 @@ class SAQWrapper : public QuantWrapper {
             throw std::runtime_error("SAQWrapper::train requires non-empty input");
         }
 
-        // 1) Run k-means to get coarse centroids and cluster assignments.
+        // 1) Run k-means to get coarse centroids.
         faiss::ClusteringParameters cp;
         cp.niter = 25;
         cp.seed = 1234;
@@ -133,7 +153,7 @@ class SAQWrapper : public QuantWrapper {
         quantizer_ = std::make_unique<faiss::IndexFlatL2>(d_);
         quantizer_->add(num_clusters_, centroids_.data());
 
-        // 2) Copy input data to Eigen row-major matrix for SAQ quantization.
+        // 2) Copy input data to Eigen row-major matrix for SAQ variance.
         saqlib::FloatRowMat data(n, d_);
 #pragma omp parallel for
         for (int64_t i = 0; i < static_cast<int64_t>(n); ++i) {
@@ -147,7 +167,8 @@ class SAQWrapper : public QuantWrapper {
         cfg.seg_eqseg = seg_eqseg_;
         cfg.use_compact_layout = use_compact_layout_;
         cfg.single.random_rotation = random_rotation_;
-        cfg.single.use_fastscan = true;
+        cfg.single.use_fastscan = true;  // kept for SaqData compatibility;
+                                         // hot path ignores fastscan entirely.
 
         saqlib::SaqDataMaker data_maker(cfg, d_);
         saqlib::FloatRowMat padded_data(n, data_maker.getPaddedDim());
@@ -156,18 +177,13 @@ class SAQWrapper : public QuantWrapper {
         data_maker.compute_variance(padded_data);
         saq_data_ = data_maker.return_data();
 
-        // 4) Reset encoded data. add() will populate searchable clusters.
-        clusters_.clear();
-        clusters_.resize(num_clusters_);
-        for (size_t c = 0; c < num_clusters_; ++c) {
-            clusters_[c] = std::make_unique<saqlib::SaqCluData>(
-                    0,
-                    saq_data_->quant_plan,
-                    use_compact_layout_,
-                    /*use_fastscan=*/true);
-        }
-        vector_cluster_ids_.clear();
-        vector_offsets_.clear();
+        // 4) Build per-segment layout and vec_stride, then pre-rotate
+        //    centroids per segment for use by set_query.
+        build_seg_layout_();
+        rotate_centroids_();
+
+        // 5) Reset blob. add() will grow it.
+        blob_.clear();
         ntotal_ = 0;
         is_trained_ = true;
     }
@@ -182,71 +198,87 @@ class SAQWrapper : public QuantWrapper {
 
         const size_t old_ntotal = ntotal_;
         ntotal_ += n;
-        vector_cluster_ids_.resize(ntotal_);
-        vector_offsets_.resize(ntotal_);
+        blob_.resize(ntotal_ * vec_stride_, 0);
 
+        // Assign to clusters.
         std::vector<float> coarse_dists(n);
         std::vector<faiss::idx_t> coarse_ids(n);
         quantizer_->search(n, x, 1, coarse_dists.data(), coarse_ids.data());
 
-        saqlib::FloatRowMat data(n, d_);
-#pragma omp parallel for
-        for (int64_t i = 0; i < static_cast<int64_t>(n); ++i) {
-            std::memcpy(data.row(i).data(), x + i * d_, sizeof(float) * d_);
-        }
-
-        std::vector<std::vector<saqlib::PID>> local_id_lists(num_clusters_);
-        for (size_t i = 0; i < n; ++i) {
-            const auto cid = coarse_ids[i];
-            if (cid < 0 || static_cast<size_t>(cid) >= num_clusters_) {
-                throw std::runtime_error("SAQWrapper::add got invalid coarse cluster id");
-            }
-            local_id_lists[cid].push_back(static_cast<saqlib::PID>(i));
-        }
-
-        std::vector<uint32_t> base_offsets(num_clusters_, 0);
-        for (size_t c = 0; c < num_clusters_; ++c) {
-            if (clusters_[c]) {
-                base_offsets[c] = static_cast<uint32_t>(clusters_[c]->num_vec_);
-            }
-        }
-
 #pragma omp parallel
         {
-            saqlib::SAQuantizer saq_quantizer(saq_data_.get());
-            saqlib::FloatVec centroid(d_);
+            // Per-thread scratch for encoding: CAQEncoders (one per segment),
+            // a uint16 buffer for compacted_code16 packing, and per-segment
+            // rotated-residual / rotated-centroid buffers.
+            std::vector<std::unique_ptr<saqlib::CAQEncoder>> encoders;
+            encoders.reserve(n_segs_);
+            for (size_t s = 0; s < n_segs_; ++s) {
+                const auto& bd = saq_data_->base_datas[s];
+                encoders.emplace_back(std::make_unique<saqlib::CAQEncoder>(
+                        bd.num_dim_pad, bd.num_bits, bd.cfg));
+            }
+            std::vector<uint16_t> code_u16_buf(total_padded_dim_);
+            saqlib::FloatVec rot_vec;
+            saqlib::FloatVec raw_seg;
 
-#pragma omp for schedule(dynamic, 1)
-            for (int64_t c = 0; c < static_cast<int64_t>(num_clusters_); ++c) {
-                const auto& ids_in_cluster = local_id_lists[c];
-                if (ids_in_cluster.empty()) {
-                    continue;
+#pragma omp for schedule(static)
+            for (int64_t i = 0; i < static_cast<int64_t>(n); ++i) {
+                const auto cid = coarse_ids[i];
+                if (cid < 0 || static_cast<size_t>(cid) >= num_clusters_) {
+                    throw std::runtime_error("SAQWrapper::add got invalid coarse id");
                 }
+                const uint32_t gid = static_cast<uint32_t>(old_ntotal + i);
+                uint8_t* slot = blob_.data() + gid * vec_stride_;
+                std::memset(slot, 0, vec_stride_);
+                *reinterpret_cast<uint32_t*>(slot) = static_cast<uint32_t>(cid);
 
-                auto cluster = std::make_unique<saqlib::SaqCluData>(
-                        ids_in_cluster.size(),
-                        saq_data_->quant_plan,
-                        use_compact_layout_,
-                        /*use_fastscan=*/true);
-                std::memcpy(
-                        centroid.data(),
-                        centroids_.data() + static_cast<size_t>(c) * d_,
-                        sizeof(float) * d_);
+                for (size_t s = 0; s < n_segs_; ++s) {
+                    const auto& seg = segs_[s];
+                    const auto& bd = saq_data_->base_datas[s];
 
-                saq_quantizer.quantize_cluster(
-                        data, centroid, ids_in_cluster, *cluster);
+                    // Extract raw slice (zero-padded to seg.num_dim_pad).
+                    raw_seg.setZero(seg.num_dim_pad);
+                    raw_seg.head(seg.num_dim_copy) = Eigen::Map<const saqlib::FloatVec>(
+                            x + i * d_ + seg.src_offset, seg.num_dim_copy);
 
-                auto* ids = cluster->ids();
-                const uint32_t base_off = base_offsets[c];
-                for (size_t off = 0; off < ids_in_cluster.size(); ++off) {
-                    const auto gid =
-                            static_cast<uint32_t>(old_ntotal + static_cast<size_t>(ids_in_cluster[off]));
-                    ids[off] = static_cast<saqlib::PID>(gid);
-                    vector_cluster_ids_[gid] = static_cast<uint32_t>(c);
-                    vector_offsets_[gid] = base_off + static_cast<uint32_t>(off);
+                    // Rotate raw slice via segment's rotator (if any).
+                    if (bd.rotator) {
+                        rot_vec = raw_seg * bd.rotator->get_P();
+                    } else {
+                        rot_vec = raw_seg;
+                    }
+
+                    // Residual = rotated_vec - rotated_centroid.
+                    const float* rot_cent_ptr = rotated_centroids_.data() +
+                            (static_cast<size_t>(cid) * total_padded_dim_ +
+                             seg.padded_offset);
+                    Eigen::Map<const saqlib::FloatVec> rot_cent_vec(
+                            rot_cent_ptr, seg.num_dim_pad);
+                    saqlib::FloatVec residual = rot_vec - rot_cent_vec;
+
+                    // Encode residual → full N-bit canonical code + factors.
+                    saqlib::QuantBaseCode base_code;
+                    saqlib::FloatVec rot_cent_copy = rot_cent_vec;
+                    encoders[s]->encode_and_fac(residual, base_code, &rot_cent_copy);
+
+                    // Write factors.
+                    float* fac = reinterpret_cast<float*>(slot + seg.blob_factor_offset);
+                    fac[0] = base_code.o_l2norm;
+                    fac[1] = base_code.ip_cent_oa;
+                    fac[2] = base_code.fac_rescale;
+
+                    // Pack canonical N-bit code via CodeHelper<N>::compacted_code16.
+                    if (seg.num_bits > 0 && base_code.code.size() > 0) {
+                        for (size_t j = 0; j < seg.num_dim_pad; ++j) {
+                            code_u16_buf[j] = static_cast<uint16_t>(base_code.code[j]);
+                        }
+                        auto pack_fn = saqlib::utils::get_compacted_code16_func(
+                                static_cast<int>(seg.num_bits));
+                        pack_fn(slot + seg.blob_code_offset,
+                                code_u16_buf.data(),
+                                seg.num_dim_pad);
+                    }
                 }
-
-                clusters_[c]->append(*cluster);
             }
         }
     }
@@ -281,13 +313,10 @@ class SAQWrapper : public QuantWrapper {
         return oss.str();
     }
 
-    size_t get_dimension() const override {
-        return d_;
-    }
-
-    size_t get_ntotal() const override {
-        return ntotal_;
-    }
+    size_t get_dimension() const override { return d_; }
+    size_t get_ntotal() const override { return ntotal_; }
+    size_t get_num_clusters() const { return num_clusters_; }
+    float get_avg_bits() const { return avg_bits_; }
 
     bool save(const std::string& path) override {
         if (!is_trained_ || !saq_data_) {
@@ -299,15 +328,15 @@ class SAQWrapper : public QuantWrapper {
             return false;
         }
 
-        const uint64_t magic = 0x5341515752415050ULL; // SAQWRAPP
-        const uint64_t version = 1;
+        const uint64_t magic = 0x5341515752415050ULL;  // SAQWRAPP
+        const uint64_t version = 2;                    // blob layout
         ofs.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
         ofs.write(reinterpret_cast<const char*>(&version), sizeof(version));
 
-        auto write_u64 = [&ofs](uint64_t v) {
+        auto write_u64 = [&](uint64_t v) {
             ofs.write(reinterpret_cast<const char*>(&v), sizeof(v));
         };
-        auto write_u8 = [&ofs](uint8_t v) {
+        auto write_u8 = [&](uint8_t v) {
             ofs.write(reinterpret_cast<const char*>(&v), sizeof(v));
         };
 
@@ -326,22 +355,11 @@ class SAQWrapper : public QuantWrapper {
                 reinterpret_cast<const char*>(centroids_.data()),
                 centroids_size * sizeof(float));
 
-        const uint64_t map_size = vector_cluster_ids_.size();
-        write_u64(map_size);
-        ofs.write(
-                reinterpret_cast<const char*>(vector_cluster_ids_.data()),
-                map_size * sizeof(uint32_t));
-        ofs.write(
-                reinterpret_cast<const char*>(vector_offsets_.data()),
-                map_size * sizeof(uint32_t));
-
         saq_data_->save(ofs);
 
-        write_u64(clusters_.size());
-        for (const auto& c : clusters_) {
-            write_u64(c->num_vec_);
-            c->save(ofs);
-        }
+        write_u64(vec_stride_);
+        write_u64(blob_.size());
+        ofs.write(reinterpret_cast<const char*>(blob_.data()), blob_.size());
 
         ofs.close();
         return ofs.good();
@@ -357,16 +375,17 @@ class SAQWrapper : public QuantWrapper {
         uint64_t version = 0;
         ifs.read(reinterpret_cast<char*>(&magic), sizeof(magic));
         ifs.read(reinterpret_cast<char*>(&version), sizeof(version));
-        if (magic != 0x5341515752415050ULL || version != 1) {
+        if (magic != 0x5341515752415050ULL || version != 2) {
+            // Version 1 (cluster_data layout) is no longer supported.
             return false;
         }
 
-        auto read_u64 = [&ifs]() {
+        auto read_u64 = [&]() {
             uint64_t v = 0;
             ifs.read(reinterpret_cast<char*>(&v), sizeof(v));
             return v;
         };
-        auto read_u8 = [&ifs]() {
+        auto read_u8 = [&]() {
             uint8_t v = 0;
             ifs.read(reinterpret_cast<char*>(&v), sizeof(v));
             return v;
@@ -382,7 +401,6 @@ class SAQWrapper : public QuantWrapper {
         const bool random_rot = read_u8() != 0;
         const uint64_t ntotal = read_u64();
 
-        // Require wrapper construction params to match persisted index params.
         if (d != d_ || num_clusters != num_clusters_ ||
             std::fabs(avg_bits - avg_bits_) > 1e-6 ||
             enable_seg != enable_segmentation_ ||
@@ -398,38 +416,22 @@ class SAQWrapper : public QuantWrapper {
                 reinterpret_cast<char*>(centroids_.data()),
                 centroids_size * sizeof(float));
 
-        const uint64_t map_size = read_u64();
-        vector_cluster_ids_.resize(map_size);
-        vector_offsets_.resize(map_size);
-        ifs.read(
-                reinterpret_cast<char*>(vector_cluster_ids_.data()),
-                map_size * sizeof(uint32_t));
-        ifs.read(
-                reinterpret_cast<char*>(vector_offsets_.data()),
-                map_size * sizeof(uint32_t));
-
         saq_data_ = std::make_unique<saqlib::SaqData>();
         saq_data_->load(ifs);
-        // Only fastscan-trained files are supported now — reject anything
-        // persisted with use_fastscan=false so we fail fast instead of
-        // silently mis-decoding.
-        if (!saq_data_->base_datas.empty() &&
-            !saq_data_->base_datas.front().cfg.use_fastscan) {
+
+        build_seg_layout_();
+        rotate_centroids_();
+
+        const uint64_t vec_stride_on_disk = read_u64();
+        if (vec_stride_on_disk != vec_stride_) {
             return false;
         }
-
-        const uint64_t num_clusters_stored = read_u64();
-        clusters_.clear();
-        clusters_.resize(num_clusters_stored);
-        for (size_t c = 0; c < num_clusters_stored; ++c) {
-            const uint64_t num_vec = read_u64();
-            clusters_[c] = std::make_unique<saqlib::SaqCluData>(
-                        num_vec,
-                        saq_data_->quant_plan,
-                        use_compact_layout_,
-                        /*use_fastscan=*/true);
-            clusters_[c]->load(ifs);
+        const uint64_t blob_size = read_u64();
+        if (blob_size != ntotal * vec_stride_) {
+            return false;
         }
+        blob_.resize(blob_size);
+        ifs.read(reinterpret_cast<char*>(blob_.data()), blob_size);
 
         if (!ifs.good()) {
             return false;
@@ -443,17 +445,129 @@ class SAQWrapper : public QuantWrapper {
         return true;
     }
 
-    size_t get_num_clusters() const {
-        return num_clusters_;
-    }
-
-    float get_avg_bits() const {
-        return avg_bits_;
-    }
-
-   private:
+  private:
     friend class SAQDistanceComputer;
 
+    // Per-segment packed layout (computed from saq_data_->base_datas[s]).
+    struct SegLayout {
+        size_t num_dim_pad;       // D_s
+        size_t num_dim_copy;      // how many of num_dim_pad are from raw input
+        size_t src_offset;        // offset into the raw d_-dim vector
+        size_t padded_offset;     // offset into concat padded space
+        size_t num_bits;          // N_s
+        size_t code_bytes;        // D_s * N_s / 8
+        size_t blob_factor_offset; // byte offset into vec_stride_ for {xn, icn, rs}
+        size_t blob_code_offset;  // byte offset into vec_stride_ for code bytes
+        float caq_delta;          // 2 / 2^N_s
+        float v_nom;              // -1 + caq_delta/2
+        float (*ip_func)(const float*, const uint8_t*, size_t);
+        saqlib::utils::IP_FUNC_4_t ip_func_4;
+    };
+
+    // Inline per-vec, per-seg *partial* distance contribution (no
+    // per-cluster term). The total distance formula is
+    //
+    //   dist = ||q - c||² + Σ_s [ o_l2sqr_s - 2 * rescale_s * (ext_s - icn_s) ]
+    //
+    // where the second term is one call per segment per vec. ||q - c||²
+    // is added ONCE per vec outside the segment loop (fetched lazily from
+    // q_minus_c_total_ in the DistanceComputer).
+    //
+    //   ext_s    = caq_delta_s * <q_rot_s, code> + v_nom_s * sum_q_s
+    //              ≈ <q_rot_s, nominal_r_s>
+    //   part_s   = o_l2sqr_s - 2 * rescale_s * (ext_s - icn_s)
+    static inline float seg_partial_from_ip(
+            const SegLayout& seg,
+            const uint8_t* slot,
+            float ip_q_code,
+            float sum_q_s) {
+        const float* fac = reinterpret_cast<const float*>(slot + seg.blob_factor_offset);
+        const float xn = fac[0];
+        const float icn = fac[1];
+        const float rs = fac[2];
+        const float ext = seg.caq_delta * ip_q_code + seg.v_nom * sum_q_s;
+        return xn * xn - 2.0f * rs * (ext - icn);
+    }
+
+    void build_seg_layout_() {
+        segs_.clear();
+        n_segs_ = saq_data_->base_datas.size();
+        segs_.reserve(n_segs_);
+
+        size_t src_offset_acc = 0;
+        size_t padded_offset_acc = 0;
+        // Factors region: 12 bytes per seg, starts at byte 8.
+        constexpr size_t kHeaderBytes = 8;
+        constexpr size_t kFactorBytesPerSeg = 12;
+        size_t code_region_begin = kHeaderBytes + kFactorBytesPerSeg * n_segs_;
+        // Round code region start up to 16-byte boundary so per-seg codes
+        // line up with SIMD loads.
+        code_region_begin = (code_region_begin + 15) & ~size_t(15);
+
+        size_t code_cursor = code_region_begin;
+        for (size_t s = 0; s < n_segs_; ++s) {
+            const auto& bd = saq_data_->base_datas[s];
+            SegLayout seg{};
+            seg.num_dim_pad = bd.num_dim_pad;
+            seg.num_bits = bd.num_bits;
+            seg.src_offset = src_offset_acc;
+            seg.padded_offset = padded_offset_acc;
+            seg.num_dim_copy = std::min(seg.num_dim_pad,
+                                        d_ > src_offset_acc ? d_ - src_offset_acc : size_t(0));
+            seg.code_bytes = seg.num_dim_pad * seg.num_bits / 8;
+            seg.blob_factor_offset = kHeaderBytes + kFactorBytesPerSeg * s;
+            seg.blob_code_offset = code_cursor;
+            seg.caq_delta = seg.num_bits > 0
+                    ? 2.0f / static_cast<float>(1 << seg.num_bits)
+                    : 0.0f;
+            seg.v_nom = seg.num_bits > 0
+                    ? -1.0f + seg.caq_delta * 0.5f
+                    : 0.0f;
+            seg.ip_func = saqlib::utils::get_IP_FUNC(static_cast<int>(seg.num_bits));
+            seg.ip_func_4 = saqlib::utils::get_IP_FUNC_4(static_cast<int>(seg.num_bits));
+
+            // Round per-seg code region up to 16 bytes so the next segment's
+            // code starts aligned.
+            const size_t code_padded = (seg.code_bytes + 15) & ~size_t(15);
+            code_cursor += code_padded;
+
+            src_offset_acc += seg.num_dim_pad;
+            padded_offset_acc += seg.num_dim_pad;
+            segs_.push_back(seg);
+        }
+
+        total_padded_dim_ = padded_offset_acc;
+        vec_stride_ = (code_cursor + 63) & ~size_t(63);  // round to cache line
+    }
+
+    void rotate_centroids_() {
+        rotated_centroids_.assign(num_clusters_ * total_padded_dim_, 0.0f);
+        saqlib::FloatVec raw_seg;
+        saqlib::FloatVec rot_vec;
+        for (size_t c = 0; c < num_clusters_; ++c) {
+            for (size_t s = 0; s < n_segs_; ++s) {
+                const auto& seg = segs_[s];
+                const auto& bd = saq_data_->base_datas[s];
+
+                raw_seg.setZero(seg.num_dim_pad);
+                raw_seg.head(seg.num_dim_copy) = Eigen::Map<const saqlib::FloatVec>(
+                        centroids_.data() + c * d_ + seg.src_offset,
+                        seg.num_dim_copy);
+
+                if (bd.rotator) {
+                    rot_vec = raw_seg * bd.rotator->get_P();
+                } else {
+                    rot_vec = raw_seg;
+                }
+
+                float* dst = rotated_centroids_.data() +
+                        c * total_padded_dim_ + seg.padded_offset;
+                std::memcpy(dst, rot_vec.data(), sizeof(float) * seg.num_dim_pad);
+            }
+        }
+    }
+
+    // Configuration
     size_t d_;
     float avg_bits_;
     size_t num_clusters_;
@@ -463,54 +577,130 @@ class SAQWrapper : public QuantWrapper {
     bool random_rotation_;
     faiss::MetricType metric_;
 
+    // Runtime state
     size_t ntotal_ = 0;
     bool is_trained_ = false;
+    size_t n_segs_ = 0;
+    size_t total_padded_dim_ = 0;
+    size_t vec_stride_ = 0;
 
-    std::vector<float> centroids_;
-    std::vector<uint32_t> vector_cluster_ids_;
-    std::vector<uint32_t> vector_offsets_;
+    std::vector<SegLayout> segs_;
 
+    // Training artifacts
+    std::vector<float> centroids_;                  // num_clusters * d_, raw
+    std::vector<float, saqlib::memory::AlignedAllocator<float, 64>>
+            rotated_centroids_;                     // num_clusters * total_padded_dim_
     std::unique_ptr<faiss::IndexFlatL2> quantizer_;
     std::unique_ptr<saqlib::SaqData> saq_data_;
-    std::vector<std::unique_ptr<saqlib::SaqCluData>> clusters_;
+
+    // Flat per-vec blob
+    std::vector<uint8_t, saqlib::memory::AlignedAllocator<uint8_t, 64>> blob_;
 };
 
+// ---------------------------------------------------------------------
+// SAQDistanceComputer implementation
+// ---------------------------------------------------------------------
+
+
 inline void SAQDistanceComputer::set_query(const float* x) {
-    query_.resize(parent_->d_);
-    std::memcpy(query_.data(), x, sizeof(float) * parent_->d_);
-    fast_estimator_ = std::make_unique<FastEstimator>(
-            *parent_->saq_data_, searcher_cfg_, query_);
-    prepared_cluster_ = std::numeric_limits<uint32_t>::max();
-    prepared_block_   = std::numeric_limits<uint32_t>::max();
+    const size_t n_segs = parent_->n_segs_;
+    const size_t num_clusters = parent_->num_clusters_;
+
+    // Rotate query per segment, cache sum_q per segment.
+    q_rot_per_seg_.resize(n_segs);
+    sum_q_per_seg_.resize(n_segs);
+    for (size_t s = 0; s < n_segs; ++s) {
+        const auto& seg = parent_->segs_[s];
+        const auto& bd = parent_->saq_data_->base_datas[s];
+
+        saqlib::FloatVec raw_seg = saqlib::FloatVec::Zero(seg.num_dim_pad);
+        raw_seg.head(seg.num_dim_copy) = Eigen::Map<const saqlib::FloatVec>(
+                x + seg.src_offset, seg.num_dim_copy);
+        if (bd.rotator) {
+            q_rot_per_seg_[s] = raw_seg * bd.rotator->get_P();
+        } else {
+            q_rot_per_seg_[s] = raw_seg;
+        }
+        sum_q_per_seg_[s] = q_rot_per_seg_[s].sum();
+    }
+
+    // Bump query generation. The lazy get_q_minus_c_total_ path recomputes
+    // any cluster whose cluster_gen_[cid] doesn't match. We never re-zero
+    // the arrays, so set_query stays O(n_segs * padded_dim) rather than
+    // O(num_clusters * padded_dim) — a huge win on HNSW where we only
+    // visit a tiny fraction of clusters per query.
+    if (cluster_gen_.size() != num_clusters) {
+        cluster_gen_.assign(num_clusters, 0);
+        q_minus_c_total_.assign(num_clusters, 0.0f);
+    }
+    ++query_gen_;
+    if (query_gen_ == 0) {
+        // wrap-around: force recompute by resetting all gens
+        std::fill(cluster_gen_.begin(), cluster_gen_.end(), 0);
+        query_gen_ = 1;
+    }
+}
+
+inline float SAQDistanceComputer::get_q_minus_c_total_(uint32_t cid) {
+    if (cluster_gen_[cid] == query_gen_) {
+        return q_minus_c_total_[cid];
+    }
+    const size_t n_segs = parent_->n_segs_;
+    float acc = 0.0f;
+    for (size_t s = 0; s < n_segs; ++s) {
+        const auto& seg = parent_->segs_[s];
+        const float* cent = parent_->rotated_centroids_.data() +
+                static_cast<size_t>(cid) * parent_->total_padded_dim_ +
+                seg.padded_offset;
+        const float* q = q_rot_per_seg_[s].data();
+        const size_t D = seg.num_dim_pad;
+
+        // Opt 1: AVX-512 SIMD. D is always a multiple of
+        // saqlib::kDimPaddingSize (=64), enforced in SaqDataMaker, so no
+        // tail handling is needed. FP associativity prevents auto-vec
+        // of the scalar version on a raw `sub += d*d;` reduction, so we
+        // do it by hand to get a guaranteed 16-way FMA chain.
+        __m512 acc_vec = _mm512_setzero_ps();
+        for (size_t j = 0; j < D; j += 16) {
+            __m512 qv = _mm512_loadu_ps(q + j);
+            __m512 cv = _mm512_loadu_ps(cent + j);
+            __m512 diff = _mm512_sub_ps(qv, cv);
+            acc_vec = _mm512_fmadd_ps(diff, diff, acc_vec);
+        }
+        acc += _mm512_reduce_add_ps(acc_vec);
+    }
+    q_minus_c_total_[cid] = acc;
+    cluster_gen_[cid] = query_gen_;
+    return acc;
 }
 
 inline float SAQDistanceComputer::operator()(faiss::idx_t i) {
     if (i < 0 || static_cast<size_t>(i) >= parent_->ntotal_) {
         return std::numeric_limits<float>::infinity();
     }
+    const uint8_t* slot = parent_->blob_.data() + static_cast<size_t>(i) * parent_->vec_stride_;
+    const uint32_t cid = *reinterpret_cast<const uint32_t*>(slot);
+    const size_t n_segs = parent_->n_segs_;
 
-    const uint32_t cid = parent_->vector_cluster_ids_[i];
-    const uint32_t off = parent_->vector_offsets_[i];
-    if (cid >= parent_->clusters_.size() ||
-        off >= parent_->clusters_[cid]->num_vec_) {
-        return std::numeric_limits<float>::infinity();
+    float dist = get_q_minus_c_total_(cid);
+    for (size_t s = 0; s < n_segs; ++s) {
+        const auto& seg = parent_->segs_[s];
+        if (seg.num_bits == 0) {
+            const float* fac = reinterpret_cast<const float*>(slot + seg.blob_factor_offset);
+            const float xn = fac[0];
+            dist += xn * xn;
+            continue;
+        }
+        const uint8_t* code = slot + seg.blob_code_offset;
+        const float ip_q_code = seg.ip_func(
+                q_rot_per_seg_[s].data(), code, seg.num_dim_pad);
+        dist += SAQWrapper::seg_partial_from_ip(
+                seg, slot, ip_q_code, sum_q_per_seg_[s]);
     }
-
-    const uint32_t block = off / saqlib::KFastScanSize;
-    if (cid != prepared_cluster_) {
-        fast_estimator_->prepare(parent_->clusters_[cid].get());
-        prepared_cluster_ = cid;
-        prepared_block_   = std::numeric_limits<uint32_t>::max();
-    }
-    if (block != prepared_block_) {
-        fast_estimator_->compFastDist(block, nullptr);
-        prepared_block_ = block;
-    }
-    const float dist = fast_estimator_->compAccurateDist(off);
-    if (!std::isfinite(dist)) {
-        return std::numeric_limits<float>::infinity();
-    }
-    return dist;
+    // Opt 5: drop isfinite — inputs are always finite (CAQEncoder guards
+    // against fac_rescale=0 / ext_eq_icn degeneracies at caq_encoder.hpp:227).
+    // std::max compiles to branchless maxss.
+    return std::max(0.0f, dist);
 }
 
 inline void SAQDistanceComputer::distances_batch_4(
@@ -522,109 +712,69 @@ inline void SAQDistanceComputer::distances_batch_4(
         float& dis1,
         float& dis2,
         float& dis3) {
-    constexpr int N = 4;
-    const faiss::idx_t idxs[N] = {idx0, idx1, idx2, idx3};
-
-    uint32_t cids[N], offs[N], blks[N];
-    for (int i = 0; i < N; i++) {
-        cids[i] = parent_->vector_cluster_ids_[idxs[i]];
-        offs[i] = parent_->vector_offsets_[idxs[i]];
-        blks[i] = offs[i] / saqlib::KFastScanSize;
-        if (cids[i] >= parent_->clusters_.size() ||
-            offs[i] >= parent_->clusters_[cids[i]]->num_vec_) {
+    const faiss::idx_t idxs[4] = {idx0, idx1, idx2, idx3};
+    for (int k = 0; k < 4; ++k) {
+        if (idxs[k] < 0 || static_cast<size_t>(idxs[k]) >= parent_->ntotal_) {
             dis0 = (*this)(idx0); dis1 = (*this)(idx1);
             dis2 = (*this)(idx2); dis3 = (*this)(idx3);
             return;
         }
     }
 
-    const size_t n_segs = fast_estimator_->getEstimators().size();
-    // Stack storage (supports up to 8 segments; fall back if more)
-    constexpr size_t kMaxSegs = 8;
-    if (n_segs > kMaxSegs) {
-        dis0 = (*this)(idx0); dis1 = (*this)(idx1);
-        dis2 = (*this)(idx2); dis3 = (*this)(idx3);
-        return;
+    const size_t n_segs = parent_->n_segs_;
+    const uint8_t* slots[4];
+    uint32_t cids[4];
+    for (int k = 0; k < 4; ++k) {
+        slots[k] = parent_->blob_.data() + static_cast<size_t>(idxs[k]) * parent_->vec_stride_;
+        cids[k] = *reinterpret_cast<const uint32_t*>(slots[k]);
     }
 
-    // Phase 1: Prepare each cluster+block sequentially, save per-segment data.
-    // The Lut is shared across clusters (built once from q in the constructor),
-    // so we only need to save the cluster-specific values before switching to
-    // the next cluster.
-    float saved_ip_xbq[N][kMaxSegs] = {};
-    float saved_q_l2sqr[N][kMaxSegs] = {};
-    float saved_cent_corr[N][kMaxSegs] = {};
-
-    for (int i = 0; i < N; i++) {
-        if (cids[i] != prepared_cluster_) {
-            fast_estimator_->prepare(parent_->clusters_[cids[i]].get());
-            prepared_cluster_ = cids[i];
-            prepared_block_ = std::numeric_limits<uint32_t>::max();
-        }
-        if (blks[i] != prepared_block_) {
-            fast_estimator_->compFastDist(blks[i], nullptr);
-            prepared_block_ = blks[i];
-        }
-        // Save before this cluster's state is overwritten by next iteration
-        for (size_t s = 0; s < n_segs; s++) {
-            auto& est = fast_estimator_->getEstimators()[s];
-            saved_ip_xbq[i][s] =
-                    est.getLut().getIPXBQPrime(offs[i] % saqlib::KFastScanSize);
-            saved_q_l2sqr[i][s] = est.getQl2sqr();
-            saved_cent_corr[i][s] = est.getCentCorrection(offs[i]);
-        }
+    // Per-cluster ||q - c||² once per vec (lazy, cached across vecs in the
+    // same cluster via cluster_gen_).
+    float dis[4];
+    for (int k = 0; k < 4; ++k) {
+        dis[k] = get_q_minus_c_total_(cids[k]);
     }
 
-    // Phase 2: Per-segment batch IP + combine. The Lut is shared across all
-    // clusters (built once from q in the constructor), so computeRawIPs_4
-    // can pass in long_codes from four different clusters. The per-cluster
-    // terms are saved_q_l2sqr (= ||q - c_i||²) and saved_cent_corr (=
-    // 2 * rescale * <c_i, nominal_r>).
-    float dis[N] = {};
-    for (size_t s = 0; s < n_segs; s++) {
-        const uint8_t* long_codes[N];
-        float rescales[N], o_l2norms[N];
-        for (int i = 0; i < N; i++) {
-            const auto& seg = parent_->clusters_[cids[i]]->get_segment(s);
-            long_codes[i] = seg.long_code(offs[i]);
-            rescales[i] = seg.long_factor(offs[i]).rescale;
-            o_l2norms[i] = seg.factor_o_l2norm(blks[i])[offs[i] % saqlib::KFastScanSize];
+    for (size_t s = 0; s < n_segs; ++s) {
+        const auto& seg = parent_->segs_[s];
+        if (seg.num_bits == 0) {
+            for (int k = 0; k < 4; ++k) {
+                const float* fac = reinterpret_cast<const float*>(
+                        slots[k] + seg.blob_factor_offset);
+                const float xn = fac[0];
+                dis[k] += xn * xn;
+            }
+            continue;
         }
 
-        float raw[N];
-        fast_estimator_->getEstimators()[s].getLut().computeRawIPs_4(
-                long_codes[0], long_codes[1], long_codes[2], long_codes[3],
-                raw[0], raw[1], raw[2], raw[3]);
-
-        const float sq_delta = fast_estimator_->getEstimators()[s].getSqDelta();
-        const float sum_q =
-                fast_estimator_->getEstimators()[s].getLut().getSumQ();
-
-        for (int i = 0; i < N; i++) {
-            // ext_ip ≈ <q, nominal_r_i> (LUT built from q, sum_q = sum(q)).
-            float ext_ip =
-                    saved_ip_xbq[i][s] + raw[i] * sq_delta +
-                    (-1.0f + sq_delta * 0.5f) * sum_q;
-            float ip_o_q = rescales[i] * ext_ip;
-            float o_l2sqr = o_l2norms[i] * o_l2norms[i];
-            dis[i] += o_l2sqr + saved_q_l2sqr[i][s] - 2.0f * ip_o_q +
-                    saved_cent_corr[i][s];
+        // Batch 4-way IP sharing the query.
+        const uint8_t* c0 = slots[0] + seg.blob_code_offset;
+        const uint8_t* c1 = slots[1] + seg.blob_code_offset;
+        const uint8_t* c2 = slots[2] + seg.blob_code_offset;
+        const uint8_t* c3 = slots[3] + seg.blob_code_offset;
+        float ip[4];
+        seg.ip_func_4(
+                q_rot_per_seg_[s].data(),
+                c0, c1, c2, c3,
+                seg.num_dim_pad,
+                ip[0], ip[1], ip[2], ip[3]);
+        const float sum_q_s = sum_q_per_seg_[s];
+        for (int k = 0; k < 4; ++k) {
+            dis[k] += SAQWrapper::seg_partial_from_ip(
+                    seg, slots[k], ip[k], sum_q_s);
         }
     }
 
-    dis0 = std::isfinite(dis[0]) ? std::max(0.0f, dis[0])
-                                 : std::numeric_limits<float>::infinity();
-    dis1 = std::isfinite(dis[1]) ? std::max(0.0f, dis[1])
-                                 : std::numeric_limits<float>::infinity();
-    dis2 = std::isfinite(dis[2]) ? std::max(0.0f, dis[2])
-                                 : std::numeric_limits<float>::infinity();
-    dis3 = std::isfinite(dis[3]) ? std::max(0.0f, dis[3])
-                                 : std::numeric_limits<float>::infinity();
+    // Opt 5: drop isfinite (inputs are always finite), keep branchless max.
+    dis0 = std::max(0.0f, dis[0]);
+    dis1 = std::max(0.0f, dis[1]);
+    dis2 = std::max(0.0f, dis[2]);
+    dis3 = std::max(0.0f, dis[3]);
 }
 
 inline bool parse_saq_bool(const std::string& v) {
-    return v == "1" || v == "true" || v == "TRUE" || v == "on" ||
-            v == "yes";
+    return v == "1" || v == "true" || v == "TRUE" || v == "on" || v == "yes";
 }
 
 inline std::unique_ptr<QuantWrapper> create_saq_wrapper(
