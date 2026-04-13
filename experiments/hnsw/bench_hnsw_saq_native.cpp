@@ -86,6 +86,53 @@ static inline float popcount_ip_1bit(
     return delta * (float)ip_sum + vl * (float)ppc_sum;
 }
 
+// Batch-4 popcount IP: interleaves memory loads from 4 data streams so the
+// CPU can issue 4 independent load chains in parallel.
+[[gnu::always_inline]]
+static inline void popcount_ip_1bit_4(
+        const uint8_t* __restrict__ d0, const uint8_t* __restrict__ d1,
+        const uint8_t* __restrict__ d2, const uint8_t* __restrict__ d3,
+        const uint64_t* __restrict__ query_bin,
+        float delta, float vl, size_t padded_dim,
+        float& r0, float& r1, float& r2, float& r3) {
+    const auto* p0 = reinterpret_cast<const uint64_t*>(d0);
+    const auto* p1 = reinterpret_cast<const uint64_t*>(d1);
+    const auto* p2 = reinterpret_cast<const uint64_t*>(d2);
+    const auto* p3 = reinterpret_cast<const uint64_t*>(d3);
+    const size_t nblk = padded_dim / 64;
+    uint64_t ip0 = 0, ip1 = 0, ip2 = 0, ip3 = 0;
+    uint64_t pc0 = 0, pc1 = 0, pc2 = 0, pc3 = 0;
+    for (size_t i = 0; i < nblk; i++) {
+        uint64_t x0 = p0[i], x1 = p1[i], x2 = p2[i], x3 = p3[i];
+        pc0 += __builtin_popcountll(x0);
+        pc1 += __builtin_popcountll(x1);
+        pc2 += __builtin_popcountll(x2);
+        pc3 += __builtin_popcountll(x3);
+        const uint64_t* qb = query_bin + i * 4;
+        uint64_t q0 = qb[0], q1 = qb[1], q2 = qb[2], q3 = qb[3];
+        ip0 += (uint64_t)__builtin_popcountll(x0 & q0);
+        ip0 += (uint64_t)__builtin_popcountll(x0 & q1) << 1;
+        ip0 += (uint64_t)__builtin_popcountll(x0 & q2) << 2;
+        ip0 += (uint64_t)__builtin_popcountll(x0 & q3) << 3;
+        ip1 += (uint64_t)__builtin_popcountll(x1 & q0);
+        ip1 += (uint64_t)__builtin_popcountll(x1 & q1) << 1;
+        ip1 += (uint64_t)__builtin_popcountll(x1 & q2) << 2;
+        ip1 += (uint64_t)__builtin_popcountll(x1 & q3) << 3;
+        ip2 += (uint64_t)__builtin_popcountll(x2 & q0);
+        ip2 += (uint64_t)__builtin_popcountll(x2 & q1) << 1;
+        ip2 += (uint64_t)__builtin_popcountll(x2 & q2) << 2;
+        ip2 += (uint64_t)__builtin_popcountll(x2 & q3) << 3;
+        ip3 += (uint64_t)__builtin_popcountll(x3 & q0);
+        ip3 += (uint64_t)__builtin_popcountll(x3 & q1) << 1;
+        ip3 += (uint64_t)__builtin_popcountll(x3 & q2) << 2;
+        ip3 += (uint64_t)__builtin_popcountll(x3 & q3) << 3;
+    }
+    r0 = delta * (float)ip0 + vl * (float)pc0;
+    r1 = delta * (float)ip1 + vl * (float)pc1;
+    r2 = delta * (float)ip2 + vl * (float)pc2;
+    r3 = delta * (float)ip3 + vl * (float)pc3;
+}
+
 // =====================================================================
 // SAQNativeIndex — per-vec blob with full N-bit code + 1-bit shadow
 // =====================================================================
@@ -531,6 +578,56 @@ struct QS {
         low = est - kEpsilon * err_sum;
     }
 
+    // Batch-4 cheap 1-bit estimates.
+    void cheap_dist_4(const faiss::idx_t* ids,
+                      float* est, float* low) {
+        const uint8_t* base = idx->blob();
+        size_t stride = idx->vec_stride();
+        const uint8_t* sl0 = base + (size_t)ids[0] * stride;
+        const uint8_t* sl1 = base + (size_t)ids[1] * stride;
+        const uint8_t* sl2 = base + (size_t)ids[2] * stride;
+        const uint8_t* sl3 = base + (size_t)ids[3] * stride;
+        uint32_t c0 = *(const uint32_t*)sl0;
+        uint32_t c1 = *(const uint32_t*)sl1;
+        uint32_t c2 = *(const uint32_t*)sl2;
+        uint32_t c3 = *(const uint32_t*)sl3;
+        ensure_cluster(c0); ensure_cluster(c1);
+        ensure_cluster(c2); ensure_cluster(c3);
+
+        size_t ns = idx->n_segs();
+        float e0 = 0, e1 = 0, e2 = 0, e3 = 0;
+        float er0 = 0, er1 = 0, er2 = 0, er3 = 0;
+        for (size_t s = 0; s < ns; s++) {
+            auto& sg = idx->segs()[s];
+            float ga0 = qc_seg_sqr[c0*ns+s], ge0 = qc_seg_nrm[c0*ns+s];
+            float ga1 = qc_seg_sqr[c1*ns+s], ge1 = qc_seg_nrm[c1*ns+s];
+            float ga2 = qc_seg_sqr[c2*ns+s], ge2 = qc_seg_nrm[c2*ns+s];
+            float ga3 = qc_seg_sqr[c3*ns+s], ge3 = qc_seg_nrm[c3*ns+s];
+
+            float ip0, ip1, ip2, ip3;
+            popcount_ip_1bit_4(
+                sl0 + sg.shadow_code_offset, sl1 + sg.shadow_code_offset,
+                sl2 + sg.shadow_code_offset, sl3 + sg.shadow_code_offset,
+                q_bin[s].data(), q_delta[s], q_vl[s], sg.num_dim_pad,
+                ip0, ip1, ip2, ip3);
+            float kq = sum_q[s] * (-0.5f);
+
+            const float* sf0 = (const float*)(sl0 + sg.shadow_factor_offset);
+            const float* sf1 = (const float*)(sl1 + sg.shadow_factor_offset);
+            const float* sf2 = (const float*)(sl2 + sg.shadow_factor_offset);
+            const float* sf3 = (const float*)(sl3 + sg.shadow_factor_offset);
+            e0 += sf0[0] + ga0 + sf0[1] * (ip0 + kq);
+            e1 += sf1[0] + ga1 + sf1[1] * (ip1 + kq);
+            e2 += sf2[0] + ga2 + sf2[1] * (ip2 + kq);
+            e3 += sf3[0] + ga3 + sf3[1] * (ip3 + kq);
+            er0 += sf0[2] * ge0; er1 += sf1[2] * ge1;
+            er2 += sf2[2] * ge2; er3 += sf3[2] * ge3;
+        }
+        est[0] = e0; est[1] = e1; est[2] = e2; est[3] = e3;
+        low[0] = e0 - kEpsilon*er0; low[1] = e1 - kEpsilon*er1;
+        low[2] = e2 - kEpsilon*er2; low[3] = e3 - kEpsilon*er3;
+    }
+
     // Full N-bit distance.
     float full_dist(faiss::idx_t id) {
         const uint8_t* sl = idx->blob() + (size_t)id * idx->vec_stride();
@@ -547,6 +644,49 @@ struct QS {
             d += SAQNativeIndex::seg_full_partial(sg, sl, ip, sum_q[s]);
         }
         return std::max(0.0f, d);
+    }
+
+    // Batch-4 full N-bit distances.
+    void full_dist_4(const faiss::idx_t* ids, float* out) {
+        const uint8_t* base = idx->blob();
+        size_t stride = idx->vec_stride();
+        const uint8_t* sl0 = base + (size_t)ids[0] * stride;
+        const uint8_t* sl1 = base + (size_t)ids[1] * stride;
+        const uint8_t* sl2 = base + (size_t)ids[2] * stride;
+        const uint8_t* sl3 = base + (size_t)ids[3] * stride;
+        uint32_t c0 = *(const uint32_t*)sl0;
+        uint32_t c1 = *(const uint32_t*)sl1;
+        uint32_t c2 = *(const uint32_t*)sl2;
+        uint32_t c3 = *(const uint32_t*)sl3;
+        ensure_cluster(c0); ensure_cluster(c1);
+        ensure_cluster(c2); ensure_cluster(c3);
+
+        float d0 = qc_sqr[c0], d1 = qc_sqr[c1];
+        float d2 = qc_sqr[c2], d3 = qc_sqr[c3];
+        for (size_t s = 0; s < idx->n_segs(); s++) {
+            auto& sg = idx->segs()[s];
+            if (sg.num_bits == 0) {
+                float xn0 = *(const float*)(sl0 + sg.full_factor_offset);
+                float xn1 = *(const float*)(sl1 + sg.full_factor_offset);
+                float xn2 = *(const float*)(sl2 + sg.full_factor_offset);
+                float xn3 = *(const float*)(sl3 + sg.full_factor_offset);
+                d0 += xn0*xn0; d1 += xn1*xn1;
+                d2 += xn2*xn2; d3 += xn3*xn3;
+                continue;
+            }
+            float ip0, ip1, ip2, ip3;
+            sg.ip_func_4(
+                q_rot[s].data(),
+                sl0 + sg.full_code_offset, sl1 + sg.full_code_offset,
+                sl2 + sg.full_code_offset, sl3 + sg.full_code_offset,
+                sg.num_dim_pad, ip0, ip1, ip2, ip3);
+            d0 += SAQNativeIndex::seg_full_partial(sg, sl0, ip0, sum_q[s]);
+            d1 += SAQNativeIndex::seg_full_partial(sg, sl1, ip1, sum_q[s]);
+            d2 += SAQNativeIndex::seg_full_partial(sg, sl2, ip2, sum_q[s]);
+            d3 += SAQNativeIndex::seg_full_partial(sg, sl3, ip3, sum_q[s]);
+        }
+        out[0] = std::max(0.0f, d0); out[1] = std::max(0.0f, d1);
+        out[2] = std::max(0.0f, d2); out[3] = std::max(0.0f, d3);
     }
 };
 
@@ -612,10 +752,18 @@ QStats saq_native_search(
             st.nhops++; nids[nv++] = nb;
         }
 
-        // Phase 2: cheap 1-bit estimates.
-        for (size_t i = 0; i < nv; i++) {
-            qs.cheap_dist(nids[i], nest[i], nlow[i]);
-            st.ndis1++;
+        // Phase 2: cheap 1-bit estimates (batch-4 + scalar tail).
+        {
+            size_t i = 0;
+            for (; i + 4 <= nv; i += 4) {
+                faiss::idx_t b4[4] = {nids[i], nids[i+1], nids[i+2], nids[i+3]};
+                qs.cheap_dist_4(b4, nest + i, nlow + i);
+                st.ndis1 += 4;
+            }
+            for (; i < nv; i++) {
+                qs.cheap_dist(nids[i], nest[i], nlow[i]);
+                st.ndis1++;
+            }
         }
 
         // Phase 3: decide who needs full refinement.
@@ -625,23 +773,38 @@ QStats saq_native_search(
             if (nref[i]) rpos[nr++] = i;
         }
 
-        // Phase 4: full N-bit distances for survivors.
-        for (size_t i = 0; i < nr; i++) {
-            size_t p = rpos[i];
-            float d = qs.full_dist(nids[p]); st.ndis2++;
-            nest[p] = d; nlow[p] = d;
+        // Phase 4: full N-bit distances for survivors (batch-4 + scalar tail).
+        {
+            size_t i = 0;
+            for (; i + 4 <= nr; i += 4) {
+                faiss::idx_t batch_ids[4] = {nids[rpos[i]], nids[rpos[i+1]],
+                                              nids[rpos[i+2]], nids[rpos[i+3]]};
+                float batch_d[4];
+                qs.full_dist_4(batch_ids, batch_d);
+                st.ndis2 += 4;
+                for (int j = 0; j < 4; j++) {
+                    nest[rpos[i+j]] = batch_d[j]; nlow[rpos[i+j]] = batch_d[j];
+                }
+            }
+            for (; i < nr; i++) {
+                size_t p = rpos[i];
+                float d = qs.full_dist(nids[p]); st.ndis2++;
+                nest[p] = d; nlow[p] = d;
+            }
         }
 
-        // Phase 5: only refined candidates enter both queues (with the
-        // accurate full distance). Unrefined candidates are dropped.
+        // Phase 5: update candidates and topk.
+        // All neighbours with est < bound enter the candidates queue (so
+        // unrefined neighbours can still be explored). Only refined
+        // neighbours enter topk (with their accurate full distance).
         for (size_t i = 0; i < nv; i++) {
+            if (cands.size() < ef || nest[i] < bound) {
+                cands.push({nest[i], nlow[i], nids[i]});
+            }
             if (nref[i]) {
-                if (topk.size() < ef || nest[i] < bound) {
-                    cands.push({nest[i], nlow[i], nids[i]});
-                    topk.push({nest[i], nlow[i], nids[i]});
-                    if (topk.size() > ef) topk.pop();
-                    if (topk.size() >= ef) bound = topk.top().est;
-                }
+                topk.push({nest[i], nlow[i], nids[i]});
+                if (topk.size() > ef) topk.pop();
+                if (topk.size() >= ef) bound = topk.top().est;
             }
         }
     }
