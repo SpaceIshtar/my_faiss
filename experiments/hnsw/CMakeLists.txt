@@ -91,7 +91,7 @@ target_include_directories(bench_hnsw_quant PRIVATE
 )
 target_link_libraries(bench_hnsw_quant PRIVATE faiss_avx512 -lglpk -larmadillo OpenMP::OpenMP_CXX)
 target_compile_options(bench_hnsw_quant PRIVATE -march=native -mfma)
-target_compile_definitions(bench_hnsw_quant PRIVATE VAQ_OPTIMIZE EIGEN_DONT_PARALLELIZE TURBOQUANT_HAS_FAISS_DISTANCE_COMPUTER)
+target_compile_definitions(bench_hnsw_quant PRIVATE VAQ_OPTIMIZE EIGEN_DONT_PARALLELIZE)
 
 # ============================================================
 # Cache profiling tool (train/profile modes for cachegrind)
@@ -111,6 +111,18 @@ target_include_directories(bench_hnsw_rabitq_native PRIVATE
 target_link_libraries(bench_hnsw_rabitq_native PRIVATE faiss_avx512 OpenMP::OpenMP_CXX)
 target_compile_options(bench_hnsw_rabitq_native PRIVATE -march=native -mfma)  # Required for RaBitQ
 
+# ============================================================
+# Native SAQ benchmark (two-stage search with Cauchy-Schwarz pruning)
+# ============================================================
+add_executable(bench_hnsw_saq_native EXCLUDE_FROM_ALL bench_hnsw_saq_native.cpp)
+target_include_directories(bench_hnsw_saq_native PRIVATE
+    ${HNSW_INCLUDE_DIR}
+    ${SAQ_INCLUDE_DIR}
+    ${SAQ_CORE_INCLUDE_DIR}
+)
+target_link_libraries(bench_hnsw_saq_native PRIVATE faiss_avx512 OpenMP::OpenMP_CXX)
+target_compile_options(bench_hnsw_saq_native PRIVATE -march=native -mfma)
+
 add_custom_target(all_hnsw_benchmarks
     DEPENDS
         build_hnsw_index
@@ -121,6 +133,7 @@ add_custom_target(all_hnsw_benchmarks
         bench_hnsw_quant
         bench_hnsw_quant_profile
         bench_hnsw_rabitq_native
+        bench_hnsw_saq_native
 )
 
 # Copy config files to build directory
